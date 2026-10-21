@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 disktree-core = { workspace = true }
+rayon = { workspace = true }
 # Pure Rust zstd: the agent is cross-built for the Sparks with nothing but
 # rust-lld, and the C library would need a C cross compiler and a sysroot.
 # Its encoder only has the fastest level, which is about zstd -1.

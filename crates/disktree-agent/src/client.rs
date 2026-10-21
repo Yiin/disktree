@@ -489,15 +489,54 @@ impl RemoteScan {
 }
 
 /// The scan worker: progress until the tree, then the tree.
+///
+/// Decompressing a chunk and decoding it take about as long as each
+/// other, so the decoder has a thread of its own and the two overlap.
 fn receive_tree(
     replies: &Receiver<Reply>,
     progress: &Mutex<ScanSnapshot>,
     transfer: &Mutex<Option<Transfer>>,
 ) -> io::Result<Node> {
-    let mut builder = TreeBuilder::new();
-    let mut wire_bytes = 0;
-    let mut raw_bytes = 0;
-    let mut raw = Vec::with_capacity(CHUNK * 2);
+    let (raw_chunks, decoder_input) = mpsc::sync_channel::<Vec<u8>>(4);
+    let decoder = thread::Builder::new()
+        .name("disktree-tree-decode".into())
+        .spawn(move || {
+            let mut builder = TreeBuilder::new();
+            for raw in decoder_input {
+                builder.feed(&raw)?;
+            }
+            Ok::<_, io::Error>(builder)
+        })?;
+    let received = receive_chunks(replies, progress, &raw_chunks);
+    drop(raw_chunks);
+    let builder = decoder
+        .join()
+        .map_err(|_| io::Error::other("the tree decoder panicked"))?;
+    // The decoder's own error first: a chunk it refused is why the
+    // receiving stopped.
+    let builder = builder?;
+    let (mut done, started) = received?;
+    if builder.nodes() != done.nodes {
+        return Err(invalid(format!(
+            "the agent sent {} nodes and {} arrived",
+            done.nodes,
+            builder.nodes()
+        )));
+    }
+    let tree = builder.finish()?;
+    done.elapsed = started.map_or(Duration::ZERO, |at| at.elapsed());
+    *lock(transfer) = Some(done);
+    Ok(tree)
+}
+
+/// Progress, then the tree's chunks decompressed into `raw_chunks`, until
+/// the agent says how many nodes it sent; with when the first chunk came.
+fn receive_chunks(
+    replies: &Receiver<Reply>,
+    progress: &Mutex<ScanSnapshot>,
+    raw_chunks: &mpsc::SyncSender<Vec<u8>>,
+) -> io::Result<(Transfer, Option<Instant>)> {
+    let mut transfer = Transfer::default();
     let mut started = None;
     loop {
         let reply = replies
@@ -513,33 +552,23 @@ fn receive_tree(
             }
             Reply::TreeChunk(chunk) => {
                 started.get_or_insert_with(Instant::now);
-                wire_bytes += chunk.len() as u64;
-                raw.clear();
+                transfer.wire_bytes += chunk.len() as u64;
+                let mut raw = Vec::with_capacity(CHUNK * 2);
                 let mut source = chunk.as_slice();
                 StreamingDecoder::new(&mut source)
                     .map_err(|error| invalid(format!("a tree chunk: {error}")))?
                     // A chunk is cut at the first node boundary past CHUNK,
-                    // so twice that is far more than any honest one.
+                    // so four times that is far more than any honest one.
                     .take((CHUNK * 4) as u64)
                     .read_to_end(&mut raw)?;
-                builder.feed(&raw)?;
-                raw_bytes += raw.len() as u64;
+                transfer.raw_bytes += raw.len() as u64;
+                raw_chunks.send(raw).map_err(|_| {
+                    io::Error::other("the tree decoder stopped early")
+                })?;
             }
             Reply::TreeEnd { nodes } => {
-                if builder.nodes() != nodes {
-                    return Err(invalid(format!(
-                        "the agent sent {nodes} nodes and {} arrived",
-                        builder.nodes()
-                    )));
-                }
-                let tree = builder.finish()?;
-                *lock(transfer) = Some(Transfer {
-                    nodes,
-                    wire_bytes,
-                    raw_bytes,
-                    elapsed: started.map_or(Duration::ZERO, |at| at.elapsed()),
-                });
-                return Ok(tree);
+                transfer.nodes = nodes;
+                return Ok((transfer, started));
             }
             Reply::Failed { kind, message } => {
                 return Err(io::Error::new(kind, message));

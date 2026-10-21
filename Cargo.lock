@@ -1423,6 +1423,7 @@ name = "disktree-agent"
 version = "0.11.0"
 dependencies = [
  "disktree-core",
+ "rayon",
  "rustix",
  "ruzstd",
  "tempfile",

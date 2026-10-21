@@ -15,6 +15,7 @@ use std::time::Duration;
 use disktree_core::removal::{self, RemovalEvent, RemovalMode, Target};
 use disktree_core::scan::{ScanHandle, ScanOptions, ScanSnapshot};
 use disktree_core::space;
+use rayon::prelude::*;
 use ruzstd::encoding::{CompressionLevel, compress_to_vec};
 
 use crate::protocol::{Hello, PROTOCOL, Reply, Request, SpaceReport, preamble};
@@ -101,13 +102,18 @@ pub fn serve(
             }
             continue;
         }
+        // Registered here, before the work starts, so a cancel sent right
+        // behind its request is never read before there is a flag to set.
+        let cancel = Arc::new(AtomicBool::new(false));
+        lock(&agent.cancels).insert(id, Arc::clone(&cancel));
         let agent = Arc::clone(&agent);
         thread::Builder::new()
             .name(format!("disktree-agent-{id}"))
             .spawn(move || {
                 // A failed send means the client is gone; the read loop
                 // sees the same end and stops.
-                let _ = agent.answer(id, request);
+                let _ = agent.answer(id, request, &cancel);
+                lock(&agent.cancels).remove(&id);
             })?;
     }
     Ok(())
@@ -127,9 +133,16 @@ impl Agent {
         output.flush()
     }
 
-    fn answer(&self, id: u64, request: Request) -> io::Result<()> {
+    fn answer(
+        &self,
+        id: u64,
+        request: Request,
+        cancel: &AtomicBool,
+    ) -> io::Result<()> {
         match request {
-            Request::Scan { root, options } => self.scan(id, root, options),
+            Request::Scan { root, options } => {
+                self.scan(id, root, options, cancel)
+            }
             Request::Space { path } => {
                 self.send(id, &Reply::Space(space_report(&path)))
             }
@@ -140,7 +153,7 @@ impl Agent {
                 root,
                 targets,
                 mode,
-            } => self.remove(id, &root, &targets, mode),
+            } => self.remove(id, &root, &targets, mode, cancel),
             Request::Volumes => {
                 self.send(id, &Reply::Volumes(space::volumes()))
             }
@@ -148,19 +161,13 @@ impl Agent {
         }
     }
 
-    fn cancellable(&self, id: u64) -> Arc<AtomicBool> {
-        let flag = Arc::new(AtomicBool::new(false));
-        lock(&self.cancels).insert(id, Arc::clone(&flag));
-        flag
-    }
-
     fn scan(
         &self,
         id: u64,
         root: PathBuf,
         options: ScanOptions,
+        cancel: &AtomicBool,
     ) -> io::Result<()> {
-        let cancel = self.cancellable(id);
         let scan = ScanHandle::spawn(root, options);
         let mut sent = ScanSnapshot::default();
         let outcome = loop {
@@ -180,7 +187,6 @@ impl Agent {
             }
             thread::sleep(PROGRESS_EVERY);
         };
-        lock(&self.cancels).remove(&id);
         match outcome {
             // Whoever cancelled has moved on: a partial tree of a whole
             // disk is a lot of bytes for nobody.
@@ -192,10 +198,15 @@ impl Agent {
                 },
             ),
             Ok(tree) => {
+                let mut batch = Vec::new();
                 let nodes = encode_tree(&tree, CHUNK, |raw| {
-                    let chunk = compress_to_vec(raw, CompressionLevel::Fastest);
-                    self.send(id, &Reply::TreeChunk(chunk))
+                    batch.push(raw.to_vec());
+                    if batch.len() >= rayon::current_num_threads() {
+                        self.send_compressed(id, &mut batch)?;
+                    }
+                    Ok(())
                 })?;
+                self.send_compressed(id, &mut batch)?;
                 self.send(id, &Reply::TreeEnd { nodes })
             }
             Err(error) => self.send(
@@ -208,6 +219,27 @@ impl Agent {
         }
     }
 
+    /// Compress `batch` across every core and send it in order. One core
+    /// compresses a whole disk's tree about seven times slower than it is
+    /// encoded; a batch per core keeps the chunks streaming in order.
+    fn send_compressed(
+        &self,
+        id: u64,
+        batch: &mut Vec<Vec<u8>>,
+    ) -> io::Result<()> {
+        let chunks: Vec<Vec<u8>> = batch
+            .par_iter()
+            .map(|raw| {
+                compress_to_vec(raw.as_slice(), CompressionLevel::Fastest)
+            })
+            .collect();
+        batch.clear();
+        for chunk in chunks {
+            self.send(id, &Reply::TreeChunk(chunk))?;
+        }
+        Ok(())
+    }
+
     /// Remove what this machine's own plan allows, and report what it
     /// refused as failures: the client's idea of what is safe here is
     /// never what decides.
@@ -217,8 +249,8 @@ impl Agent {
         root: &Path,
         targets: &[Target],
         mode: RemovalMode,
+        cancel: &AtomicBool,
     ) -> io::Result<()> {
-        let cancel = self.cancellable(id);
         let plan = removal::plan(targets, root);
         let refused: Vec<RemovalEvent> = plan
             .blocked
@@ -260,7 +292,6 @@ impl Agent {
                     bytes,
                     failed,
                 } => {
-                    lock(&self.cancels).remove(&id);
                     return self.send(
                         id,
                         &Reply::Removal(RemovalEvent::Done {
@@ -290,4 +321,53 @@ fn space_report(path: &Path) -> SpaceReport {
 /// critical section is one insert, remove or frame write.
 fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{read_preamble, tag};
+
+    /// Collects what the agent writes, for a test to read afterwards.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            lock(&self.0).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_unknown_request_is_answered_and_the_agent_keeps_serving() {
+        let mut input = Vec::new();
+        // Request 99 from a newer client, id 5, and a body this agent
+        // cannot read.
+        write_frame(&mut input, 99, &[5, 0xFF, 0xFF]).unwrap();
+        let output = Captured::default();
+        serve(input.as_slice(), output.clone()).unwrap();
+
+        let written = lock(&output.0).clone();
+        let mut stream = written.as_slice();
+        assert_eq!(read_preamble(&mut stream).unwrap(), PROTOCOL);
+        let (first, hello) = read_frame(&mut stream).unwrap().unwrap();
+        assert_eq!(first, tag::HELLO);
+        assert_eq!(Hello::decode(&hello, PROTOCOL).unwrap(), super::hello());
+        let (failed, payload) = read_frame(&mut stream).unwrap().unwrap();
+        assert_eq!(failed, tag::FAILED);
+        let (id, reply) = Reply::decode(failed, &payload).unwrap();
+        assert_eq!(id, 5);
+        assert!(matches!(
+            reply,
+            Some(Reply::Failed {
+                kind: io::ErrorKind::Unsupported,
+                ..
+            })
+        ));
+    }
 }
