@@ -17,6 +17,7 @@ use gpui_kit::{
 };
 use gpui_omarchy::Theme;
 
+use crate::source::Source;
 use crate::state::{Disktree, Screen};
 
 /// A small tree on disk: two directories, a nested file, and a hidden one.
@@ -149,6 +150,39 @@ fn the_first_scan_shows_what_it_is_doing_then_the_treemap(
         "the largest entry is selected for the selection line"
     );
     assert!(hidden_present, "hidden directories are part of the tree");
+}
+
+#[gpui_kit::test]
+fn an_explicit_local_source_scans_the_tree_through_its_door(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let root = temp.path().to_path_buf();
+    // Named, not implied: the constructor a disk on another machine will use.
+    let (view, cx) = cx.add_window_view(move |_, cx| {
+        Disktree::with_source(Source::Local, root, options(), 3, cx)
+    });
+    let focus = view.read_with(cx, |app, _| app.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    draw(cx);
+    assert!(read(&view, cx, |app| app.source.is_local()));
+
+    finish_scan(&view, cx);
+    draw(cx);
+
+    let (bytes, files, space) = read(&view, cx, |app| {
+        let tree = app.tree().expect("tree");
+        (tree.bytes, tree.files, app.space.is_some())
+    });
+    assert_eq!(bytes, 601_000, "every fixture byte, through the source");
+    assert_eq!(files, 4);
+    assert!(space, "free space comes from the same source");
+
+    // The plan is the source's too: its guards run where the disk is.
+    press(cx, "space");
+    let planned = read(&view, cx, |app| app.plan().bytes());
+    assert_eq!(planned, 300_000);
 }
 
 #[gpui_kit::test]

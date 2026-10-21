@@ -66,7 +66,7 @@ pub fn root(
         .on_action(cx.listener(
             |this, _: &crate::app_menu::OpenFolder, _, cx| {
                 if this.can_start_over() {
-                    Disktree::open_folder(cx);
+                    this.open_folder(cx);
                 }
             },
         ))
@@ -2031,7 +2031,7 @@ fn disk_section(
                 })),
         );
     let mut section = div().flex().flex_col().gap(space::SM).child(header);
-    let Some(space_info) = app.space else {
+    let Some(info) = app.space else {
         return section.child(
             div()
                 .text_size(text::CAPTION)
@@ -2043,12 +2043,11 @@ fn disk_section(
     // The meter measures this volume, so it projects only the marks whose
     // bytes come back to it; the rest is said, never added.
     let reclaiming = plan.reclaim();
-    let after = space_info.after_removing(reclaiming);
+    let after = info.after_removing(reclaiming);
     let highlight = palette::highlight(theme);
-    let (number, unit) =
-        widgets::split_size(&human_bytes(space_info.available));
-    let total = space_info.total.max(1) as f32;
-    let used_now = (space_info.used() as f32 / total).clamp(0.0, 1.0);
+    let (number, unit) = widgets::split_size(&human_bytes(info.available));
+    let total = info.total.max(1) as f32;
+    let used_now = (info.used() as f32 / total).clamp(0.0, 1.0);
     let used_after = (after.used() as f32 / total).clamp(0.0, used_now);
 
     section = section.child(
@@ -2128,9 +2127,9 @@ fn disk_section(
                 .flex_row()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!("{} used", human_bytes(space_info.used())))
+                .child(format!("{} used", human_bytes(info.used())))
                 .child(div().flex_1())
-                .child(format!("{} total", human_bytes(space_info.total))),
+                .child(format!("{} total", human_bytes(info.total))),
         )
         .children(
             (!app.marks.is_empty())

@@ -17,6 +17,7 @@ mod git;
 mod marks;
 mod palette;
 mod power;
+mod source;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -36,11 +37,13 @@ use std::{
 use anyhow::{Context as _, Result};
 use disktree_core::scan::ScanOptions;
 use gpui_kit::{AppContext as _, WindowOptions, px, size};
+use source::Source;
 use state::Disktree;
 
 /// What the command line asked for.
 #[derive(Debug)]
 struct Args {
+    source: Source,
     root: PathBuf,
     options: ScanOptions,
     depth: u32,
@@ -152,14 +155,12 @@ fn run() -> Result<()> {
                         )),
                         titlebar: Some(gpui_kit::TitlebarOptions {
                             title: Some(
-                                format!(
-                                    "disktree · {}",
-                                    marks::display_path(
+                                args.source
+                                    .title(&marks::display_path(
                                         &title_root,
-                                        home.as_deref(),
-                                    )
-                                )
-                                .into(),
+                                        args.source.home().as_deref(),
+                                    ))
+                                    .into(),
                             ),
                             ..Default::default()
                         }),
@@ -179,7 +180,8 @@ fn run() -> Result<()> {
                             appearance::follow(window);
                         }
                         cx.new(|cx| {
-                            let mut app = Disktree::new(
+                            let mut app = Disktree::with_source(
+                                args.source.clone(),
                                 root_for_app.clone(),
                                 options.clone(),
                                 depth,
@@ -333,26 +335,27 @@ fn parse_args_with_power(
         !(disk && root.is_some()),
         "--disk and a PATH cannot be combined"
     );
-    let home = std::env::home_dir();
+    let source = Source::Local;
+    let home = source.home();
     let root = match root {
         _ if disk => home
             .as_deref()
-            .and_then(disktree_core::space::volume_root_for)
+            .and_then(|home| source.volume_root(home))
             .unwrap_or_else(|| PathBuf::from("/")),
         Some(root) => root,
         None => home.context("no path given and no home directory")?,
     };
     // Store the depth as the initial view setting rather than a scan option: it
     // is a display choice the run-time `[` and `]` keys also change.
-    // Canonical, so a later widening recognises this tree in the wider walk;
-    // through dunce, so Windows gets `C:\Users\…` rather than the `\\?\C:\…`
-    // form nothing else is written in.
-    let root = dunce::canonicalize(&root).unwrap_or(root);
-    let metadata = std::fs::metadata(&root)
+    // Canonical, so a later widening recognises this tree in the wider walk.
+    let root = source.canonical(root);
+    let is_dir = source
+        .is_dir(&root)
         .with_context(|| format!("cannot read {}", root.display()))?;
-    anyhow::ensure!(metadata.is_dir(), "{} is not a directory", root.display());
+    anyhow::ensure!(is_dir, "{} is not a directory", root.display());
 
     Ok(Args {
+        source,
         root,
         options,
         depth: depth.clamp(1, 6),

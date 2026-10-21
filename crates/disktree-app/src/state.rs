@@ -10,17 +10,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use disktree_core::access::file_table_readable;
 use disktree_core::filter::{Keep, Matches, filter};
 use disktree_core::insights::{Candidate, worth_a_look};
 use disktree_core::removal::{
-    Plan, RemovalEvent, RemovalHandle, RemovalMode, Target, TrashBackend,
-    detect_trash_backend, plan,
+    Plan, RemovalEvent, RemovalMode, Target, TrashBackend,
 };
-use disktree_core::scan::{Known, ScanHandle, ScanOptions, ScanSnapshot};
-use disktree_core::space::{
-    SpaceInfo, device_for, space_info, volume_root_for,
-};
+use disktree_core::scan::{Known, ScanOptions, ScanSnapshot};
+use disktree_core::space::SpaceInfo;
 use disktree_core::tree::{Metric, Node, path_of};
 use disktree_core::treemap::{
     LayoutOptions, Rect, Tile, TileKind, hit, layout_filtered,
@@ -36,6 +32,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::git::GitState;
 
 use crate::marks::{Marks, display_path, is_hidden};
+use crate::source::{Source, SourceRemoval, SourceScan};
 use crate::treemap_view::{Mosaic, TileDeco};
 
 /// What a tile's colour says.
@@ -323,6 +320,9 @@ pub struct RunSummary {
 
 /// Everything the app knows and everything it can do.
 pub struct Disktree {
+    /// The machine whose disk this is. Everything that reads or changes it
+    /// goes through here.
+    pub source: Source,
     /// The directory the tree was scanned from.
     pub root_path: PathBuf,
     pub home: Option<PathBuf>,
@@ -337,7 +337,7 @@ pub struct Disktree {
     pub power_hover: bool,
     pub cpu_threads: usize,
     pub tree: Option<Arc<Node>>,
-    pub scan: Option<ScanHandle>,
+    pub scan: Option<SourceScan>,
     pub scan_epoch: u64,
     pub progress: ScanSnapshot,
     pub scan_error: Option<String>,
@@ -384,7 +384,7 @@ pub struct Disktree {
     /// in pixels, so its header band and label thresholds are scaled by this
     /// to follow interface zoom like the rest of the interface.
     pub rem: f32,
-    pub run: Option<RemovalHandle>,
+    pub run: Option<SourceRemoval>,
     pub run_epoch: u64,
     pub run_summary: RunSummary,
     pub run_log: Vec<(PathBuf, Result<(), String>)>,
@@ -458,16 +458,31 @@ pub struct Disktree {
 }
 
 impl Disktree {
+    /// A window over this machine's disk, as the tests open one.
+    #[cfg(test)]
     pub fn new(
         root_path: PathBuf,
         options: ScanOptions,
         depth: u32,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let home = std::env::home_dir();
-        let space = space_info(&root_path).ok();
-        let trash_backend = detect_trash_backend();
+        Self::with_source(Source::Local, root_path, options, depth, cx)
+    }
+
+    /// A window over `root_path` on `source`, its first scan started.
+    pub fn with_source(
+        source: Source,
+        root_path: PathBuf,
+        options: ScanOptions,
+        depth: u32,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let home = source.home();
+        let space = source.space(&root_path);
+        let trash_backend = source.trash_backend();
+        let administrator = source.administrator();
         let mut tree = Self {
+            source,
             root_path,
             home,
             options,
@@ -537,7 +552,7 @@ impl Disktree {
             git_pending: FxHashSet::default(),
             device: None,
             full_disk_access: None,
-            administrator: disktree_core::access::administrator(),
+            administrator,
             file_table: false,
             restarting: false,
             disk_root: None,
@@ -552,16 +567,16 @@ impl Disktree {
             scan_elapsed: None,
             scanned_at: now_seconds(),
         };
-        tree.device = device_for(&tree.root_path);
+        tree.device = tree.source.device(&tree.root_path);
         tree.full_disk_access = tree
             .home
             .as_deref()
-            .and_then(disktree_core::access::full_disk_access);
+            .and_then(|home| tree.source.full_disk_access(home));
         // The disk of what is on screen, as `set_root` keeps it: `disktree
         // /Volumes/Ext` then `g` measures that drive, like opening it with ⌘O.
-        tree.disk_root = volume_root_for(&tree.root_path);
-        tree.file_table = file_table_readable(&tree.root_path);
-        disktree_core::removal::prime_mount_points();
+        tree.disk_root = tree.source.volume_root(&tree.root_path);
+        tree.file_table = tree.source.file_table_readable(&tree.root_path);
+        tree.source.prime_mount_points();
         tree.start_scan(cx);
         Self::start_space_ticker(cx);
         tree
@@ -597,13 +612,15 @@ impl Disktree {
     /// Scan a different root from scratch. Marks are kept; a mark outside
     /// the new root is shown as kept back, never removed.
     pub fn set_root(&mut self, root: PathBuf, cx: &mut Context<'_, Self>) {
-        self.space = space_info(&root).ok();
-        self.device = device_for(&root);
+        self.space = self.source.space(&root);
+        self.device = self.source.device(&root);
         // "Whole disk" means the disk of what is on screen, which a new root
         // can change: an external drive has its own.
-        self.disk_root =
-            volume_root_for(&root).or_else(|| self.disk_root.take());
-        self.file_table = file_table_readable(&root);
+        self.disk_root = self
+            .source
+            .volume_root(&root)
+            .or_else(|| self.disk_root.take());
+        self.file_table = self.source.file_table_readable(&root);
         self.root_path = root;
         self.screen = Screen::Explore;
         self.start_scan(cx);
@@ -637,11 +654,8 @@ impl Disktree {
             path: self.root_path.clone(),
             tree,
         };
-        self.scan = Some(ScanHandle::spawn_with(
-            above,
-            self.options.clone(),
-            Some(known),
-        ));
+        self.scan =
+            Some(self.source.scan(above, self.options.clone(), Some(known)));
         Self::poll_scan(epoch, cx);
         cx.notify();
     }
@@ -653,6 +667,7 @@ impl Disktree {
         self.volume_epoch += 1;
         let epoch = self.volume_epoch;
         let root_path = self.root_path.clone();
+        let source = self.source.clone();
         self.volumes.clear();
         self.volume_highlight = 0;
         self.volumes_loading = true;
@@ -660,20 +675,9 @@ impl Disktree {
         self.focus_request = Some(FocusTarget::Dialog);
         // Removable media and network volumes can take seconds to answer.
         // Keep Escape and the window responsive while probing them.
-        let task = cx.background_executor().spawn(async move {
-            let mut volumes = disktree_core::space::volumes();
-            if let Some(root) = volume_root_for(&root_path)
-                && !volumes.iter().any(|volume| volume.point == root)
-            {
-                volumes.push(disktree_core::space::Volume {
-                    point: root.clone(),
-                    device: device_for(&root),
-                    space: space_info(&root).ok(),
-                });
-            }
-            volumes.retain(|volume| volume.point != root_path);
-            volumes
-        });
+        let task = cx
+            .background_executor()
+            .spawn(async move { source.volumes_besides(&root_path) });
         cx.spawn(async move |this, cx| {
             let volumes = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -768,7 +772,8 @@ impl Disktree {
         self.git_pending.insert(path.clone());
         let task = cx.background_executor().spawn({
             let path = path.clone();
-            async move { crate::git::state(&path) }
+            let source = self.source.clone();
+            async move { source.git_state(&path) }
         });
         cx.spawn(async move |this, cx| {
             let state = task.await;
@@ -807,7 +812,7 @@ impl Disktree {
         scan.cancel();
         // The poller stops at its next tick instead of taking the result.
         self.scan_epoch += 1;
-        self.progress = scan.progress.snapshot();
+        self.progress = scan.progress();
         self.scan_elapsed = self.scan_started.map(|started| started.elapsed());
         self.scan_root.clone_from(&self.root_path);
         cx.notify();
@@ -940,9 +945,10 @@ impl Disktree {
         self.scan_started = Some(Instant::now());
         self.scan_elapsed = None;
         self.scan_root.clone_from(&self.root_path);
-        self.scan = Some(ScanHandle::spawn(
+        self.scan = Some(self.source.scan(
             self.root_path.clone(),
             self.options.clone(),
+            None,
         ));
         Self::poll_scan(epoch, cx);
         cx.notify();
@@ -979,7 +985,7 @@ impl Disktree {
         let Some(scan) = &self.scan else {
             return false;
         };
-        self.progress = scan.progress.snapshot();
+        self.progress = scan.progress();
         let Some(outcome) = scan.poll() else {
             cx.notify();
             return true;
@@ -993,9 +999,10 @@ impl Disktree {
                 if came_from.is_some() {
                     self.clear_filter();
                     self.root_path.clone_from(&self.scan_root);
-                    self.space = space_info(&self.root_path).ok();
-                    self.device = device_for(&self.root_path);
-                    self.file_table = file_table_readable(&self.root_path);
+                    self.space = self.source.space(&self.root_path);
+                    self.device = self.source.device(&self.root_path);
+                    self.file_table =
+                        self.source.file_table_readable(&self.root_path);
                 }
                 let metric = self.options.metric;
                 self.marks.refresh(&self.root_path, &node, metric);
@@ -1057,8 +1064,7 @@ impl Disktree {
                 cx.background_executor().timer(interval).await;
                 let ok = this
                     .update(cx, |this, cx| {
-                        let path = this.root_path.clone();
-                        let fresh = space_info(&path).ok();
+                        let fresh = this.source.space(&this.root_path);
                         if fresh != this.space {
                             this.space = fresh;
                             cx.notify();
@@ -1767,7 +1773,7 @@ impl Disktree {
 
     /// The plan the review screen shows and the removal runs.
     pub fn plan(&self) -> Plan {
-        plan(self.marks.items(), &self.root_path)
+        self.source.plan(self.marks.items(), &self.root_path)
     }
 
     // ── layout and hit-testing ──────────────────────────────────────────
@@ -2207,7 +2213,7 @@ impl Disktree {
         };
         self.run_log.clear();
         self.screen = Screen::Running;
-        self.run = Some(disktree_core::removal::spawn(plan, self.removal_mode));
+        self.run = Some(self.source.remove(plan, self.removal_mode));
         Self::poll_removal(epoch, cx);
         cx.notify();
     }
@@ -2401,7 +2407,11 @@ impl Disktree {
 
     /// Ask for a directory and scan it: an app opened from the Dock has no
     /// command line to name one.
-    pub fn open_folder(cx: &Context<'_, Self>) {
+    pub fn open_folder(&mut self, cx: &mut Context<'_, Self>) {
+        // The system picker lists this machine's folders.
+        if !self.on_this_machine("choosing a folder", cx) {
+            return;
+        }
         let chosen = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
             files: false,
             directories: true,
@@ -2504,8 +2514,11 @@ impl Disktree {
         let Some(path) = self.path_at(&crumbs) else {
             return;
         };
+        if !self.on_this_machine("showing in the file manager", cx) {
+            return;
+        }
         // GPUI's reveal cannot report failure, so check what it can't.
-        if std::fs::symlink_metadata(&path).is_err() {
+        if !self.source.exists(&path) {
             self.notice = Some((
                 format!(
                     "{} is no longer on disk",
@@ -2517,6 +2530,24 @@ impl Disktree {
             return;
         }
         cx.reveal_path(&path);
+    }
+
+    /// Whether `action`, which acts on this machine, can act on the disk on
+    /// screen. When the disk is another machine's it says so instead.
+    fn on_this_machine(
+        &mut self,
+        action: &str,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if self.source.is_local() {
+            return true;
+        }
+        self.notice = Some((
+            format!("{action} is not available on {}", self.source.name()),
+            Status::Warning,
+        ));
+        cx.notify();
+        false
     }
 
     /// Every binding, in reading order of the hint bar, so the keys and the
@@ -3049,7 +3080,10 @@ impl Disktree {
     /// Declined, nothing changes. Not while a removal runs: quitting would
     /// stop a permanent delete halfway.
     pub fn restart_as_administrator(&mut self, cx: &mut Context<'_, Self>) {
-        if self.restarting || self.run.is_some() {
+        if self.restarting
+            || self.run.is_some()
+            || !self.on_this_machine("restarting as administrator", cx)
+        {
             return;
         }
         self.restarting = true;
@@ -3191,13 +3225,10 @@ impl Render for Disktree {
         self.tick_transition(window);
         // The titlebar names the directory on screen, however it got there:
         // a key, a click, a rescan or a folder chosen from the menu.
-        let title = format!(
-            "disktree · {}",
-            crate::marks::display_path(
-                &self.current_path(),
-                self.home.as_deref()
-            )
-        );
+        let title = self.source.title(&crate::marks::display_path(
+            &self.current_path(),
+            self.home.as_deref(),
+        ));
         if title != self.window_title {
             window.set_window_title(&title);
             self.window_title = title;
