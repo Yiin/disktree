@@ -115,6 +115,28 @@ impl Plan {
     pub const fn is_empty(&self) -> bool {
         self.targets.is_empty()
     }
+
+    /// A plan [`plan`] made on another machine, rebuilt from what it
+    /// reported: the remote agent judges marks against its own mounts and
+    /// sends the parts. Removal there re-plans what it is sent, so a plan
+    /// built here never decides what is deleted.
+    pub const fn from_parts(
+        targets: Vec<Target>,
+        covered: Vec<Target>,
+        blocked: Vec<Blocked>,
+        root: PathBuf,
+        reclaim: u64,
+        foreign: u64,
+    ) -> Self {
+        Self {
+            targets,
+            covered,
+            blocked,
+            root,
+            reclaim,
+            foreign,
+        }
+    }
 }
 
 /// Build the plan for `targets`, which must all live under `root`.

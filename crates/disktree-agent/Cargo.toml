@@ -1,0 +1,27 @@
+[package]
+name = "disktree-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Headless disktree scanner for another machine, driven over stdin and stdout"
+
+[[bin]]
+name = "disktree-agent"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+disktree-core = { workspace = true }
+# Pure Rust zstd: the agent is cross-built for the Sparks with nothing but
+# rust-lld, and the C library would need a C cross compiler and a sysroot.
+# Its encoder only has the fastest level, which is about zstd -1.
+ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["system"] }
+
+[dev-dependencies]
+tempfile = "3"
