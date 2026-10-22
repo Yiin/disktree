@@ -388,11 +388,30 @@ fn first_root(ask: &Ask, hello: &Hello) -> Option<PathBuf> {
                 home()?
             }
         }
-        Ask::Disk => disktree_core::space::volume_root(&hello.mounts, &home()?)
-            .unwrap_or_else(|| PathBuf::from("/")),
+        Ask::Disk => disk_of(&hello.mounts, &home()?),
         Ask::Path(path) if path.is_relative() => home()?.join(path),
         Ask::Path(path) => path.clone(),
     })
+}
+
+/// The whole disk `home` is on, as `-D` scans it. On `SparkOS` that is
+/// [`SPARKOS_DISK`]: `/home` is a bind of a folder on it, and the mounts
+/// above home show only the bind.
+fn disk_of(mounts: &[disktree_core::space::Mount], home: &Path) -> PathBuf {
+    let own = mounts
+        .iter()
+        .filter(|mount| home.starts_with(&mount.point))
+        .max_by_key(|mount| mount.point.as_os_str().len());
+    let sparkos = mounts
+        .iter()
+        .find(|mount| mount.point == Path::new(SPARKOS_DISK));
+    if let (Some(own), Some(disk)) = (own, sparkos)
+        && own.source == disk.source
+    {
+        return PathBuf::from(SPARKOS_DISK);
+    }
+    disktree_core::space::volume_root(mounts, home)
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// A plan in which every target is kept back for `reason`.
@@ -810,6 +829,34 @@ mod tests {
         assert_eq!(
             first_root(&Ask::Disk, &plain),
             Some(PathBuf::from("/home"))
+        );
+        // `-D` on SparkOS: home is a bind of the real disk, which is what
+        // the whole disk means there.
+        let bound = hello(
+            Some("/home/me"),
+            &[
+                ("overlay", "/"),
+                ("/dev/nvme0n1p2", SPARKOS_DISK),
+                ("/dev/nvme0n1p2", "/home"),
+                ("/dev/nvme0n1p2", "/srv"),
+            ],
+        );
+        assert_eq!(
+            first_root(&Ask::Disk, &bound),
+            Some(PathBuf::from(SPARKOS_DISK))
+        );
+        let elsewhere = hello(
+            Some("/home/me"),
+            &[
+                ("overlay", "/"),
+                ("/dev/nvme0n1p2", SPARKOS_DISK),
+                ("/dev/sdb1", "/home"),
+            ],
+        );
+        assert_eq!(
+            first_root(&Ask::Disk, &elsewhere),
+            Some(PathBuf::from("/home")),
+            "a home on another disk keeps its own"
         );
         assert_eq!(
             first_root(&Ask::Path("models".into()), &plain),

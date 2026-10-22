@@ -373,7 +373,8 @@ not ask for one there.
 
 The default root is the home directory there. On SparkOS it is
 `/run/sparkos/host`, the machine's real disk, of which `/` is only a small
-overlay.
+overlay; `-D` scans that disk too, since `/home` is a bind of a folder on
+it.
 
 On connecting, disktree copies the agent for the host's architecture to
 `~/.cache/disktree/agent-<hash>` there if it is missing, and removes the
