@@ -6,6 +6,7 @@
 //! anything: it reports the diff and fails, so a red local run is the same
 //! signal CI gives.
 
+mod agent;
 mod bundle;
 
 use std::process::{Command, ExitCode, Stdio};
@@ -20,6 +21,8 @@ tasks:
   clippy    clippy --workspace --all-targets -- -D warnings
   test      cargo test --workspace
   ci        lint, then test
+  agent     static Linux agents for aarch64 and x86_64 in target/agent/;
+              needs both musl targets' std (rustup target add)
   bundle    macOS: target/bundle/disktree.app and its zip
               --sign IDENTITY   sign with a Developer ID (default: ad hoc)
               --notarize        notarize and staple; needs NOTARY_PROFILE, or
@@ -37,6 +40,7 @@ fn main() -> ExitCode {
         "clippy" => clippy(),
         "test" => test(),
         "ci" => fmt(false).and_then(|()| clippy()).and_then(|()| test()),
+        "agent" => agent::agent(option_env!("CARGO").unwrap_or("cargo")),
         "bundle" => bundle::bundle(&args[1..]),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");

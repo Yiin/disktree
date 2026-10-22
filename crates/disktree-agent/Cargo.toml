@@ -21,6 +21,13 @@ rayon = { workspace = true }
 # Its encoder only has the fastest level, which is about zstd -1.
 ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
 
+# musl's malloc takes one lock for every allocation, and a scan allocates
+# from every core: a static agent spent 72% of its system calls in futex
+# and scanned $HOME 4.5 times slower than a glibc build. Only the musl
+# builds pay for mimalloc's C; `cargo xtask agent` compiles it with zig.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false }
+
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", features = ["system"] }
 

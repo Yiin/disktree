@@ -6,6 +6,11 @@ use std::process::ExitCode;
 
 use disktree_agent::PROTOCOL;
 
+/// See the manifest: musl's own allocator serializes a parallel scan.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const USAGE: &str = "\
 usage: disktree-agent serve       answer a disktree client on stdin/stdout
        disktree-agent --version
