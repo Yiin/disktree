@@ -2581,5 +2581,7 @@ fn live_remote_removal(cx: &mut TestAppContext) {
         "summary        removed {}, failed {}, {} bytes",
         summary.removed, summary.failed, summary.bytes
     );
+    // A link lost mid-run ends without a Done: the outcome is unknown.
+    println!("lost           {:?}", summary.lost);
     assert_eq!(summary.failed, 0, "{log:?}");
 }
