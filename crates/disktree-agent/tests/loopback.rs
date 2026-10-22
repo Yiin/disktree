@@ -310,6 +310,55 @@ fn a_forged_plan_removes_only_what_the_agent_allows() {
     assert!(keep.path().join("precious.bin").exists());
     assert!(root.join("many/f1").exists(), "unmarked neighbours stay");
     assert!(root.join(".hidden/secret").exists());
+
+    // A root that is not one: empty and `.` would normalize to a prefix of
+    // every path, and a relative one is read from the agent's directory.
+    // Nothing is judged and nothing removed, in either mode.
+    let outside = keep.path().join("precious.bin");
+    let inside = root.join("many/f2");
+    let forgeries = [
+        (PathBuf::new(), outside.clone()),
+        (PathBuf::from("."), outside.clone()),
+        (PathBuf::from("relative/root"), outside.clone()),
+        (root.join("big/.."), outside.clone()),
+        (root.to_path_buf(), PathBuf::from("many/f2")),
+        (root.to_path_buf(), root.join("big/../many/f2")),
+    ];
+    for (forged_root, path) in forgeries {
+        let refused = client.plan(&[target(&path, 4)], &forged_root);
+        let error = refused.expect_err("a forged root is not planned");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+        for mode in [RemovalMode::Permanent, RemovalMode::Trash] {
+            let forged = Plan::from_parts(
+                vec![target(&path, 4)],
+                Vec::new(),
+                Vec::new(),
+                forged_root.clone(),
+                0,
+                0,
+            );
+            let run = client.remove(&forged, mode);
+            let mut said = Vec::new();
+            loop {
+                match run.next().expect("the removal reaches its end") {
+                    RemovalEvent::Done { removed, .. } => {
+                        assert_eq!(removed, 0, "{forged_root:?} {path:?}");
+                        break;
+                    }
+                    RemovalEvent::Item { outcome, .. } => said.push(outcome),
+                    other @ RemovalEvent::Start { .. } => panic!("{other:?}"),
+                }
+            }
+            assert!(
+                said.iter().any(|outcome| outcome
+                    .as_ref()
+                    .is_err_and(|error| error.contains("not an absolute"))),
+                "{said:?}"
+            );
+        }
+    }
+    assert!(outside.exists(), "outside the root, under a forged one");
+    assert!(inside.exists(), "a relative target");
 }
 
 #[cfg(unix)]

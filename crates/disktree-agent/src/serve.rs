@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -147,6 +147,18 @@ impl Agent {
             }
             Request::Space { path } => {
                 self.send(id, &Reply::Space(space_report(&path)))
+            }
+            Request::Plan { root, targets }
+            | Request::Remove { root, targets, .. }
+                if let Some(reason) = unanchored(&root, &targets) =>
+            {
+                self.send(
+                    id,
+                    &Reply::Failed {
+                        kind: io::ErrorKind::InvalidInput,
+                        message: reason,
+                    },
+                )
             }
             Request::Plan { root, targets } => {
                 self.send(id, &Reply::Plan(removal::plan(&targets, &root)))
@@ -314,6 +326,35 @@ impl Agent {
             }
         }
     }
+}
+
+/// Why a plan or a removal is refused before anything is judged: the
+/// root and every target must be absolute, with no `..` to resolve. The
+/// guards compare spellings, and a root of `""` or `.` normalizes to the
+/// empty path, which every path starts with: it would lift the limit to
+/// the scanned root. A relative one would be taken from wherever the
+/// agent was started. The app never sends either; the agent does not
+/// count on that.
+fn unanchored(root: &Path, targets: &[Target]) -> Option<String> {
+    let anchored = |path: &Path| {
+        path.is_absolute()
+            && !path.components().any(|part| part == Component::ParentDir)
+    };
+    // Quoted, so an empty root still shows.
+    if !anchored(root) {
+        return Some(format!(
+            "the scanned root \u{201c}{}\u{201d} is not an absolute path: \
+             nothing was judged or removed",
+            root.display()
+        ));
+    }
+    targets.iter().find(|target| !anchored(&target.path)).map(|target| {
+        format!(
+            "\u{201c}{}\u{201d} is not an absolute path: nothing was judged \
+             or removed",
+            target.path.display()
+        )
+    })
 }
 
 fn space_report(path: &Path) -> SpaceReport {
