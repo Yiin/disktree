@@ -147,12 +147,37 @@ pub fn plan(targets: &[Target], root: &Path) -> Plan {
     plan_against(targets, root, &mount_points())
 }
 
+/// [`plan`], given up with `None` as soon as `stop` is set.
+///
+/// For the agent, where a plan whose asker has stopped waiting, or asked
+/// again, is work for nobody, and a long one asked again and again piles
+/// up.
+pub fn plan_until(
+    targets: &[Target],
+    root: &Path,
+    stop: &AtomicBool,
+) -> Option<Plan> {
+    plan_judged(targets, root, &mount_points(), stop)
+}
+
 /// [`plan`] against a given read of the mount table, for testing.
+fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
+    // Never stopped, so always a plan.
+    plan_judged(targets, root, mounts, &AtomicBool::new(false))
+        .unwrap_or_default()
+}
+
+/// [`plan_until`] against a given read of the mount table.
 ///
 /// One read answers both what may be removed and which volume each target's
 /// bytes belong to, so the projection cannot be built from a state of the
 /// machine the guards never saw.
-fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
+fn plan_judged(
+    targets: &[Target],
+    root: &Path,
+    mounts: &MountTable,
+    stop: &AtomicBool,
+) -> Option<Plan> {
     let root = normalize(root);
     let mut plan = Plan {
         root: root.clone(),
@@ -161,13 +186,16 @@ fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
     let mut accepted: Vec<Target> = Vec::new();
 
     if targets.is_empty() {
-        return plan;
+        return Some(plan);
     }
     // Once per plan, not per target: the review screen plans every frame.
     let homes = homes();
     let real_root = fs::canonicalize(&root).ok();
 
     for target in targets {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
         let path = normalize(&target.path);
         let reason = refuse_with(&path, &root, &homes, mounts)
             .or_else(|| linked(&path, &root, real_root.as_deref(), &homes))
@@ -190,6 +218,9 @@ fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
     accepted.sort_by(|left, right| left.path.cmp(&right.path));
     let mut outer: Vec<Target> = Vec::new();
     for target in accepted {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
         if outer
             .iter()
             .any(|candidate| within(&target.path, &candidate.path))
@@ -215,7 +246,7 @@ fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
             crate::space::Attribution::Unknown => {}
         }
     }
-    plan
+    Some(plan)
 }
 
 /// Trees the operating system owns. A whole-disk scan shows them, because

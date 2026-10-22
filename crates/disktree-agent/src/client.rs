@@ -4,8 +4,11 @@
 //!
 //! One reader thread owns the agent's output and hands each reply to the
 //! request it answers, so callers block on their own channel and nothing
-//! polls. A scan or removal gets a thread of its own that turns replies
-//! into what [`ScanHandle`] and [`RemovalHandle`] give locally.
+//! polls. One writer thread owns its input, and every request, cancel and
+//! ping is queued for it: a link that stalls holds that thread, never the
+//! caller, which is often the window's. A scan or removal gets a thread
+//! of its own that turns replies into what [`ScanHandle`] and
+//! [`RemovalHandle`] give locally.
 //!
 //! [`ScanHandle`]: disktree_core::scan::ScanHandle
 //! [`RemovalHandle`]: disktree_core::removal::RemovalHandle
@@ -13,8 +16,8 @@
 use std::collections::HashMap;
 use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
@@ -67,7 +70,10 @@ pub struct Client {
 
 #[derive(Debug)]
 struct Shared {
-    stdin: Mutex<Option<ChildStdin>>,
+    /// Frames for the writer thread, the only one that writes to the
+    /// agent. `None` once the client is dropped, which ends the writer and
+    /// with it the agent's input.
+    outbox: Mutex<Option<Sender<Vec<u8>>>>,
     routes: Mutex<Routes>,
     stderr: Arc<Mutex<Vec<u8>>>,
     next_id: AtomicU64,
@@ -115,14 +121,19 @@ impl Client {
         };
         let stderr_tail = Arc::new(Mutex::new(Vec::new()));
         let stderr_done = keep_tail(stderr, Arc::clone(&stderr_tail));
+        let (outbox, frames) = mpsc::channel();
         let shared = Arc::new(Shared {
-            stdin: Mutex::new(Some(stdin)),
+            outbox: Mutex::new(Some(outbox)),
             routes: Mutex::new(Routes::default()),
             stderr: stderr_tail,
             next_id: AtomicU64::new(1),
             deadline: Mutex::new(ANSWER_DEADLINE),
         });
 
+        let writer = Arc::downgrade(&shared);
+        thread::Builder::new()
+            .name("disktree-agent-writer".into())
+            .spawn(move || write_frames(stdin, &frames, &writer))?;
         let (introduced, introduction) = mpsc::channel();
         let reader = Arc::clone(&shared);
         thread::Builder::new()
@@ -278,21 +289,25 @@ impl Client {
         let worker = thread::Builder::new()
             .name(format!("disktree-remote-remove-{id}"))
             .spawn(move || forward_removal(&replies, &sender));
+        // A worker that never started leaves the channel closed, and
+        // `poll` says so.
         drop(worker);
         RemoteRemoval {
             id,
             shared: Arc::clone(&self.shared),
             events,
+            ended: AtomicBool::new(false),
         }
     }
 }
 
 impl Drop for Client {
-    /// Closing stdin ends the agent's read loop; the kill covers an ssh
-    /// that would linger. The reader thread then meets the end of output
-    /// and fails whatever is still open.
+    /// Closing the queue ends the writer, which closes the agent's input
+    /// and ends its read loop; the kill covers an ssh that would linger,
+    /// or a writer stuck on a stalled link. The reader thread then meets
+    /// the end of output and fails whatever is still open.
     fn drop(&mut self) {
-        drop(lock(&self.shared.stdin).take());
+        drop(lock(&self.shared.outbox).take());
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -300,7 +315,9 @@ impl Drop for Client {
 
 impl Shared {
     /// Send `request` and return where its replies will arrive. Never
-    /// fails: a request that cannot be sent gets its failure as a reply.
+    /// fails, and never waits on the link: a request that cannot be sent
+    /// gets its failure as a reply, from the writer or the reader when
+    /// they close the connection.
     fn open(&self, request: &Request) -> (u64, Receiver<Reply>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, replies) = mpsc::channel();
@@ -312,25 +329,9 @@ impl Shared {
             }
             routes.open.insert(id, sender);
         }
-        if let Err(error) = self.write(id, request) {
-            // An agent that died says why on stderr, and the reader fails
-            // every open request with that once its output ends: give it
-            // a moment to, rather than racing it with less to say.
-            let started = Instant::now();
-            while lock(&self.routes).closed.is_none()
-                && started.elapsed() < Duration::from_millis(500)
-            {
-                thread::sleep(Duration::from_millis(5));
-            }
-            let reason = with_stderr(
-                format!("could not reach the agent: {error}"),
-                &self.stderr,
-            );
-            let sender = lock(&self.routes).open.remove(&id);
-            if let Some(sender) = sender {
-                let _ = sender.send(lost(reason));
-            }
-        }
+        // A writer that stopped closed the connection first, failing this
+        // route with every other.
+        self.send(id, request);
         (id, replies)
     }
 
@@ -347,6 +348,9 @@ impl Shared {
             Ok(reply) => Ok(reply),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 lock(&self.routes).open.remove(&id);
+                // So the agent stops working on it for nobody: a plan
+                // asked again after a timeout would otherwise pile up.
+                self.send(id, &Request::Cancel);
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
@@ -361,34 +365,64 @@ impl Shared {
         }
     }
 
-    fn write(&self, id: u64, request: &Request) -> io::Result<()> {
+    /// Queue `request` for the writer. Whether it was queued: not once
+    /// the writer has stopped.
+    fn send(&self, id: u64, request: &Request) -> bool {
         let (tag, payload) = request.encode(id);
         let mut frame = Vec::with_capacity(payload.len() + 11);
-        crate::wire::write_frame(&mut frame, tag, &payload)?;
-        let mut stdin = lock(&self.stdin);
-        let pipe = stdin.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "the client was closed")
-        })?;
-        let written = pipe.write_all(&frame).and_then(|()| pipe.flush());
-        drop(stdin);
-        written
+        // Into memory, which takes every byte.
+        let _ = crate::wire::write_frame(&mut frame, tag, &payload);
+        lock(&self.outbox)
+            .as_ref()
+            .is_some_and(|outbox| outbox.send(frame).is_ok())
     }
 
-    /// End the connection: every open request fails with `reason`, and
-    /// so does every later one.
+    /// End the connection: every open request fails with the first
+    /// reason given, and so does every later one.
     fn close(&self, reason: String) {
         let mut routes = lock(&self.routes);
+        let reason = routes.closed.get_or_insert(reason).clone();
         for (_, sender) in routes.open.drain() {
             let _ = sender.send(lost(reason.clone()));
         }
-        routes.closed = Some(reason);
+    }
+}
+
+/// The writer thread: each queued frame in order, until the queue closes
+/// or a write fails. A failed write closes the connection, after a moment
+/// for the reader to do it with what the agent said on stderr, which says
+/// more than a broken pipe.
+fn write_frames(
+    mut input: impl Write,
+    frames: &Receiver<Vec<u8>>,
+    shared: &Weak<Shared>,
+) {
+    for frame in frames {
+        let Err(error) = input.write_all(&frame).and_then(|()| input.flush())
+        else {
+            continue;
+        };
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        let started = Instant::now();
+        while lock(&shared.routes).closed.is_none()
+            && started.elapsed() < Duration::from_millis(500)
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        shared.close(with_stderr(
+            format!("could not reach the agent: {error}"),
+            &shared.stderr,
+        ));
+        return;
     }
 }
 
 /// Ping the agent every `heartbeat` from a thread of its own, so a long
 /// transfer or a busy caller never keeps it quiet. Ends when the client
-/// is dropped or a ping cannot be written: a link that fails a write is
-/// closed already, and the reader says so.
+/// is dropped or the writer has stopped: a link that fails a write is
+/// closed already.
 fn ping(shared: Weak<Shared>, heartbeat: Duration) -> io::Result<()> {
     thread::Builder::new()
         .name("disktree-agent-ping".into())
@@ -399,7 +433,7 @@ fn ping(shared: Weak<Shared>, heartbeat: Duration) -> io::Result<()> {
                     return;
                 };
                 // Ids start at 1: a ping answers to nobody.
-                if shared.write(0, &Request::Ping).is_err() {
+                if !shared.send(0, &Request::Ping) {
                     return;
                 }
             }
@@ -604,7 +638,7 @@ impl RemoteScan {
     /// [`Self::poll`] then reports [`io::ErrorKind::Interrupted`].
     pub fn cancel(&self) {
         lock(&self.progress).cancelled = true;
-        let _ = self.shared.write(self.id, &Request::Cancel);
+        self.shared.send(self.id, &Request::Cancel);
     }
 
     /// How the tree crossed the wire, once it has.
@@ -712,22 +746,53 @@ pub struct RemoteRemoval {
     id: u64,
     shared: Arc<Shared>,
     events: Receiver<RemovalEvent>,
+    /// A last event, `Done` or `Lost`, has been passed on.
+    ended: AtomicBool,
 }
 
 impl RemoteRemoval {
-    /// Take the next event, if one has arrived.
+    /// Take the next event, if one has arrived. A worker that stopped
+    /// without a last event, or never started, ends the removal as
+    /// [`RemovalEvent::Lost`]: the agent may be removing still, and every
+    /// caller waits for a last event.
     pub fn poll(&self) -> Option<RemovalEvent> {
-        self.events.try_recv().ok()
+        match self.events.try_recv() {
+            Ok(event) => Some(self.passed(event)),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => self.stopped(),
+        }
     }
 
-    /// Wait for the next event; `None` after [`RemovalEvent::Done`].
+    /// Wait for the next event; `None` after the last.
     pub fn next(&self) -> Option<RemovalEvent> {
-        self.events.recv().ok()
+        match self.events.recv() {
+            Ok(event) => Some(self.passed(event)),
+            Err(_) => self.stopped(),
+        }
+    }
+
+    fn passed(&self, event: RemovalEvent) -> RemovalEvent {
+        if matches!(
+            event,
+            RemovalEvent::Done { .. } | RemovalEvent::Lost { .. }
+        ) {
+            self.ended.store(true, Ordering::Relaxed);
+        }
+        event
+    }
+
+    /// The `Lost` a worker that stopped early never sent, once.
+    fn stopped(&self) -> Option<RemovalEvent> {
+        (!self.ended.swap(true, Ordering::Relaxed)).then(|| {
+            RemovalEvent::Lost {
+                reason: "the removal's reader stopped without a word".into(),
+            }
+        })
     }
 
     /// Stop before the next target starts.
     pub fn cancel(&self) {
-        let _ = self.shared.write(self.id, &Request::Cancel);
+        self.shared.send(self.id, &Request::Cancel);
     }
 }
 
@@ -799,11 +864,8 @@ fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
-    /// An agent that introduces itself and then never answers: a call
-    /// gives up at its deadline and leaves no route behind.
-    #[test]
-    fn a_call_nobody_answers_ends_at_its_deadline_and_leaves_nothing() {
-        let temp = tempfile::tempdir().unwrap();
+    /// A stand-in agent: `sh` introduces itself as one, then runs `then`.
+    fn introduced(temp: &Path, then: &str) -> Command {
         let mut introduction = crate::protocol::preamble();
         crate::wire::write_frame(
             &mut introduction,
@@ -811,22 +873,143 @@ mod tests {
             &crate::serve::hello().encode(),
         )
         .unwrap();
-        let script = temp.path().join("introduction");
+        let script = temp.join("introduction");
         std::fs::write(&script, introduction).unwrap();
         let mut command = Command::new("sh");
-        command.args(["-c", &format!("cat '{}'; sleep 30", script.display())]);
-        let client = Client::connect(command)
+        command.args(["-c", &format!("cat '{}'; {then}", script.display())]);
+        command
+    }
+
+    /// Every request a stand-in agent wrote to `heard` has received.
+    fn heard(path: &Path) -> Vec<(u64, Request)> {
+        let bytes = std::fs::read(path).unwrap_or_default();
+        let mut stream = bytes.as_slice();
+        std::iter::from_fn(|| read_frame(&mut stream).ok().flatten())
+            .map(|(tag, payload)| Request::decode(tag, &payload).unwrap())
+            .map(|(id, request)| (id, request.unwrap()))
+            .collect()
+    }
+
+    /// An agent that introduces itself and then never answers: a call
+    /// gives up at its deadline, leaves no route behind, and tells the
+    /// agent to stop working on it.
+    #[test]
+    fn a_call_nobody_answers_ends_at_its_deadline_and_leaves_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("heard");
+        let command =
+            introduced(temp.path(), &format!("cat > '{}'", file.display()));
+        let client = Client::start(command, Duration::from_secs(60))
             .unwrap()
             .with_deadline(Duration::from_millis(200));
 
         let started = Instant::now();
-        let error = client.space(temp.path()).unwrap_err();
+        let error = client.plan(&[], temp.path()).unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(5), "it waited");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
         assert!(
             lock(&client.shared.routes).open.is_empty(),
             "a route stayed"
         );
+        while heard(&file).len() < 2 {
+            assert!(started.elapsed() < Duration::from_secs(5), "no cancel");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let requests = heard(&file);
+        assert!(matches!(requests[0], (1, Request::Plan { .. })));
+        assert!(matches!(requests[1], (1, Request::Cancel)), "{requests:?}");
+    }
+
+    /// An agent that stopped reading, as over a stalled link: the first
+    /// big request fills the pipe and holds the writer, and every call
+    /// after it still returns at once.
+    #[test]
+    fn a_stalled_link_never_holds_up_the_caller() {
+        let temp = tempfile::tempdir().unwrap();
+        let client = Client::start(
+            introduced(temp.path(), "sleep 30"),
+            Duration::from_millis(1),
+        )
+        .unwrap()
+        .with_deadline(Duration::from_millis(100));
+        // Far more than a pipe holds.
+        let targets: Vec<Target> = (0..20_000)
+            .map(|index| Target {
+                path: temp.path().join(format!("{index:0>64}")),
+                bytes: 1,
+                is_dir: false,
+                hidden: false,
+            })
+            .collect();
+        let plan = Plan::from_parts(
+            targets,
+            Vec::new(),
+            Vec::new(),
+            temp.path().to_path_buf(),
+            0,
+            0,
+        );
+
+        let started = Instant::now();
+        let removal = client.remove(&plan, RemovalMode::Permanent);
+        let scan = client.scan(temp.path(), &ScanOptions::default());
+        removal.cancel();
+        scan.cancel();
+        let _ = client.remove(&plan, RemovalMode::Permanent);
+        assert!(client.space(temp.path()).is_err(), "never answered");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a call waited on the link: {:?}",
+            started.elapsed()
+        );
+        assert!(removal.poll().is_none(), "still running there");
+    }
+
+    /// A removal whose forwarding thread stopped without a last event, or
+    /// never started, ends as lost, once: the screen waiting on it is let
+    /// go, and is told the outcome is unknown.
+    #[test]
+    fn a_removal_whose_reader_stops_ends_as_lost() {
+        let temp = tempfile::tempdir().unwrap();
+        let client =
+            Client::connect(introduced(temp.path(), "cat > /dev/null"))
+                .unwrap();
+        let removal = |sent: &[RemovalEvent]| {
+            let (sender, events) = mpsc::channel();
+            for event in sent {
+                sender.send(event.clone()).unwrap();
+            }
+            RemoteRemoval {
+                id: 7,
+                shared: Arc::clone(&client.shared),
+                events,
+                ended: AtomicBool::new(false),
+            }
+        };
+
+        let stopped = removal(&[RemovalEvent::Start { total: 2 }]);
+        assert!(matches!(
+            stopped.poll(),
+            Some(RemovalEvent::Start { total: 2 })
+        ));
+        assert!(
+            matches!(stopped.poll(), Some(RemovalEvent::Lost { .. })),
+            "the end it never sent"
+        );
+        assert!(stopped.poll().is_none(), "once");
+        assert!(matches!(
+            removal(&[]).next(),
+            Some(RemovalEvent::Lost { .. })
+        ));
+
+        let finished = removal(&[RemovalEvent::Done {
+            removed: 0,
+            bytes: 0,
+            failed: 0,
+        }]);
+        assert!(matches!(finished.poll(), Some(RemovalEvent::Done { .. })));
+        assert!(finished.poll().is_none(), "a normal end");
+        assert!(finished.next().is_none());
     }
 
     /// Once introduced, the client pings on its own, with nothing asked:
@@ -834,30 +1017,16 @@ mod tests {
     #[test]
     fn a_connected_client_pings_the_agent() {
         let temp = tempfile::tempdir().unwrap();
-        let mut introduction = crate::protocol::preamble();
-        crate::wire::write_frame(
-            &mut introduction,
-            tag::HELLO,
-            &crate::serve::hello().encode(),
-        )
-        .unwrap();
-        let script = temp.path().join("introduction");
-        std::fs::write(&script, introduction).unwrap();
-        let heard = temp.path().join("heard");
-        let mut command = Command::new("sh");
-        command.args([
-            "-c",
-            &format!("cat '{}'; cat > '{}'", script.display(), heard.display()),
-        ]);
+        let file = temp.path().join("heard");
+        let command =
+            introduced(temp.path(), &format!("cat > '{}'", file.display()));
         let client = Client::start(command, Duration::from_millis(20)).unwrap();
 
         let pings = || {
-            let bytes = std::fs::read(&heard).unwrap_or_default();
-            let mut stream = bytes.as_slice();
-            std::iter::from_fn(|| read_frame(&mut stream).ok().flatten())
-                .map(|(tag, payload)| Request::decode(tag, &payload).unwrap())
+            heard(&file)
+                .iter()
                 .inspect(|(_, request)| {
-                    assert!(matches!(request, Some(Request::Ping)));
+                    assert!(matches!(request, Request::Ping));
                 })
                 .count()
         };

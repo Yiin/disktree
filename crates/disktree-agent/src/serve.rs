@@ -97,6 +97,7 @@ fn serve_until_silent(
     let agent = Arc::new(Agent {
         output: Mutex::new(Box::new(output)),
         cancels: Mutex::new(HashMap::new()),
+        plan: Mutex::new(None),
         gone: AtomicBool::new(false),
     });
     let served = answer_requests(&agent, input, silence);
@@ -171,6 +172,13 @@ fn answer_requests(
         // behind its request is never read before there is a flag to set.
         let cancel = Arc::new(AtomicBool::new(false));
         lock(&agent.cancels).insert(id, Arc::clone(&cancel));
+        let planning = matches!(request, Request::Plan { .. });
+        if planning {
+            let older = lock(&agent.plan).replace((id, Arc::clone(&cancel)));
+            if let Some((_, older)) = older {
+                older.store(true, Ordering::Relaxed);
+            }
+        }
         let agent = Arc::clone(agent);
         thread::Builder::new()
             .name(format!("disktree-agent-{id}"))
@@ -179,6 +187,13 @@ fn answer_requests(
                 // sees the same end and stops.
                 let _ = agent.answer(id, request, &cancel);
                 lock(&agent.cancels).remove(&id);
+                if planning {
+                    let mut plan = lock(&agent.plan);
+                    if plan.as_ref().is_some_and(|(running, _)| *running == id)
+                    {
+                        *plan = None;
+                    }
+                }
             })?;
     }
 }
@@ -211,6 +226,10 @@ struct Agent {
     output: Mutex<Box<dyn Write + Send>>,
     /// Flags that stop the scan or removal with that id.
     cancels: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    /// The plan running now, by id, and the flag that stops it. One at a
+    /// time: a newer one is for newer marks, or the same asked again by a
+    /// client that gave up waiting, and either way replaces it.
+    plan: Mutex<Option<(u64, Arc<AtomicBool>)>>,
     /// Whether the client has gone: its input ended, or a reply to it
     /// could not be written. A removal stops for nobody else.
     gone: AtomicBool,
@@ -256,7 +275,17 @@ impl Agent {
                 )
             }
             Request::Plan { root, targets } => {
-                self.send(id, &Reply::Plan(removal::plan(&targets, &root)))
+                let reply = removal::plan_until(&targets, &root, cancel)
+                    .map_or_else(
+                        || Reply::Failed {
+                            kind: io::ErrorKind::Interrupted,
+                            message: "the plan was cancelled, or replaced by \
+                                      a newer one"
+                                .into(),
+                        },
+                        Reply::Plan,
+                    );
+                self.send(id, &reply)
             }
             Request::Remove {
                 root,
@@ -834,6 +863,73 @@ mod tests {
             assert!(message.contains(&said), "{id}: {message}");
         }
         assert_eq!(remaining(&targets), targets.len(), "nothing removed");
+    }
+
+    /// Plans asked one after another, each long: every one but the last
+    /// stops where it is and says so, so plans asked again and again
+    /// never pile up on the agent.
+    #[test]
+    fn a_newer_plan_replaces_the_older() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = real(&temp);
+        // Nothing there, so all are accepted and checked against each
+        // other: a plan that takes seconds.
+        let many: Vec<Target> = (0..20_000)
+            .map(|index| Target {
+                path: root.join(format!("f{index:05}")),
+                bytes: 1,
+                is_dir: false,
+                hidden: false,
+            })
+            .collect();
+        let mut input = Vec::new();
+        for id in 1..=3 {
+            input.extend(frame(
+                &Request::Plan {
+                    root: root.clone(),
+                    targets: many.clone(),
+                },
+                id,
+            ));
+        }
+        input.extend(frame(
+            &Request::Plan {
+                root,
+                targets: many[..1].to_vec(),
+            },
+            4,
+        ));
+        // Kept open: an input that ends cancels everything running.
+        let (reader, mut writer) = io::pipe().unwrap();
+        let output = Captured::default();
+        let serving = thread::spawn({
+            let output = output.clone();
+            move || serve(reader, output)
+        });
+        let started = std::time::Instant::now();
+        writer.write_all(&input).unwrap();
+
+        let mut answered = replies(&output, 4);
+        assert!(started.elapsed() < Duration::from_secs(5), "they ran on");
+        drop(writer);
+        serving.join().unwrap().unwrap();
+        answered.sort_by_key(|(id, _)| *id);
+        for (id, reply) in &answered[..3] {
+            assert!(
+                matches!(
+                    reply,
+                    Reply::Failed {
+                        kind: io::ErrorKind::Interrupted,
+                        ..
+                    }
+                ),
+                "{id}: {reply:?}"
+            );
+        }
+        let (_, Reply::Plan(plan)) = &answered[3] else {
+            panic!("{:?}", answered[3]);
+        };
+        assert_eq!(plan.targets.len(), 1);
     }
 
     #[test]
