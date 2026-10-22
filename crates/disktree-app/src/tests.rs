@@ -302,6 +302,41 @@ fn a_permanent_deletion_asks_in_an_alert_dialog_then_removes(
     );
 }
 
+/// Delete with every mark kept back says why instead of doing nothing
+/// without a word.
+#[gpui_kit::test]
+fn delete_with_every_mark_kept_back_says_why(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let outside = tempfile::TempDir::new().expect("outside");
+    let (view, cx) = view_over(temp.path(), cx);
+    let focus = view.read_with(cx, |app, _| app.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    draw(cx);
+    update(&view, cx, |app, _| {
+        app.removal_mode = RemovalMode::Permanent;
+        app.marks.toggle(disktree_core::removal::Target {
+            path: outside.path().to_path_buf(),
+            bytes: 1,
+            is_dir: true,
+            hidden: false,
+        });
+    });
+    press(cx, "c");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+    press(cx, "enter");
+    let (confirm, notice) =
+        read(&view, cx, |app| (app.confirm_open, app.notice.clone()));
+    assert!(!confirm, "nothing to confirm");
+    let (notice, _) = notice.expect("a notice says why");
+    assert!(
+        notice.contains("nothing can be removed")
+            && notice.contains("outside the scanned root"),
+        "{notice}"
+    );
+    assert!(outside.path().exists());
+}
+
 /// A removal whose link is lost before its end says the outcome is
 /// unknown, with no counts, keeps the marks for the rescan, and does not
 /// scan into the lost connection.
@@ -1980,6 +2015,40 @@ fn finish_connect(view: &Entity<Disktree>, cx: &mut Window) {
     panic!("connecting never finished");
 }
 
+/// The plan for the marks on a remote source, once the agent's answer has
+/// landed, read through the poll the answer watch drives.
+fn settled_plan(
+    view: &Entity<Disktree>,
+    cx: &mut Window,
+) -> disktree_core::removal::Plan {
+    for _ in 0..6_000 {
+        let plan = update(view, cx, |app, cx| {
+            app.take_answers(cx);
+            app.plan()
+        });
+        if !crate::remote::is_checking(&plan) {
+            return plan;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the agent never judged the plan");
+}
+
+/// Free space on a remote source, once the first reading has landed.
+fn settled_space(view: &Entity<Disktree>, cx: &mut Window) -> bool {
+    for _ in 0..6_000 {
+        let space = update(view, cx, |app, cx| {
+            app.take_answers(cx);
+            app.space.is_some()
+        });
+        if space {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    false
+}
+
 /// Another machine, played by the agent binary on this one: the window
 /// connects, scans through the agent, marks, reviews and removes, and the
 /// agent's own guards refuse what its plan would not allow.
@@ -2020,12 +2089,12 @@ fn a_remote_source_scans_marks_and_removes_through_its_agent(
     finish_scan(&view, cx);
     draw(cx);
 
-    let (bytes, files, space, trail, shown) = read(&view, cx, |app| {
+    let space = settled_space(&view, cx);
+    let (bytes, files, trail, shown) = read(&view, cx, |app| {
         let tree = app.tree().expect("tree");
         (
             tree.bytes,
             tree.files,
-            app.space.is_some(),
             app.breadcrumbs()[0].0.clone(),
             crate::widgets::display_root(app),
         )
@@ -2057,14 +2126,17 @@ fn a_remote_source_scans_marks_and_removes_through_its_agent(
             is_dir: true,
             hidden: false,
         });
-        let plan = app.plan();
-        assert_eq!(plan.targets.len(), 2, "{plan:?}");
-        assert_eq!(plan.blocked.len(), 1, "{plan:?}");
-        assert!(
-            plan.blocked[0].reason.contains("outside the scanned root"),
-            "{plan:?}"
-        );
+        let asked = app.plan();
+        assert!(crate::remote::is_checking(&asked), "asked, not awaited");
+        assert!(asked.is_empty(), "nothing acts before the agent judges");
     });
+    let plan = settled_plan(&view, cx);
+    assert_eq!(plan.targets.len(), 2, "{plan:?}");
+    assert_eq!(plan.blocked.len(), 1, "{plan:?}");
+    assert!(
+        plan.blocked[0].reason.contains("outside the scanned root"),
+        "{plan:?}"
+    );
 
     // After the review was planned, `swap` becomes a link out of the root.
     // The app's plan still lists swap/deeper; the agent plans again and
@@ -2263,21 +2335,34 @@ fn live_remote_scan(cx: &mut TestAppContext) {
     println!("connected in   {connected:.2?}");
     println!("scanned in     {scanned:.2?} (from start)");
 
+    // `DISKTREE_LIVE_PLAN`, paths there separated by `:`, is what to ask
+    // the agent to plan; by default `usr` and the home's `.cache` there.
     let root_path = read(&view, cx, |app| app.root_path.clone());
-    let plan = read(&view, cx, |app| {
-        let target = |path: PathBuf| disktree_core::removal::Target {
-            path,
-            bytes: 0,
-            is_dir: true,
-            hidden: false,
-        };
+    let target = |path: PathBuf| disktree_core::removal::Target {
+        path,
+        bytes: 0,
+        is_dir: true,
+        hidden: false,
+    };
+    let targets: Vec<_> = if let Ok(paths) = std::env::var("DISKTREE_LIVE_PLAN")
+    {
+        paths.split(':').map(PathBuf::from).map(target).collect()
+    } else {
         let mut targets = vec![target(root_path.join("usr"))];
-        if let Some(home) = &app.home {
-            let inside = home.strip_prefix("/").unwrap_or(home);
+        if let Some(home) = read(&view, cx, |app| app.home.clone()) {
+            let inside = home.strip_prefix("/").unwrap_or(&home);
             targets.push(target(root_path.join(inside).join(".cache")));
         }
-        app.source.plan(&targets, &root_path)
-    });
+        targets
+    };
+    let mut plan = read(&view, cx, |app| app.source.plan(&targets, &root_path));
+    for _ in 0..6_000 {
+        if !crate::remote::is_checking(&plan) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        plan = read(&view, cx, |app| app.source.plan(&targets, &root_path));
+    }
     for target in &plan.targets {
         println!("plan allows    {}", target.path.display());
     }
@@ -2343,6 +2428,17 @@ fn live_remote_removal(cx: &mut TestAppContext) {
             .expect("the mark is in the root");
         app.toggle_mark(&[index], cx);
     });
+    let plan = settled_plan(&view, cx);
+    for target in &plan.targets {
+        println!("plan allows    {}", target.path.display());
+    }
+    for blocked in &plan.blocked {
+        println!(
+            "plan refuses   {}: {}",
+            blocked.path.display(),
+            blocked.reason
+        );
+    }
     press(cx, "c");
     assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
     press(cx, if mode == RemovalMode::Trash { "m" } else { "p" });

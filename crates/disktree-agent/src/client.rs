@@ -37,6 +37,12 @@ use crate::wire::{invalid, read_frame};
 /// key exchange included, with room for a slow link.
 const HANDSHAKE: Duration = Duration::from_secs(30);
 
+/// How long a request with one answer waits for it. A link on the same
+/// network answers in milliseconds; past this the agent or the link is
+/// stuck, and the caller gets an error instead of a thread parked for
+/// good.
+const ANSWER_DEADLINE: Duration = Duration::from_secs(15);
+
 /// How much of the agent's stderr is kept for an error message: the tail
 /// of an ssh failure or a crash, not a log.
 const STDERR_TAIL: usize = 4096;
@@ -55,6 +61,8 @@ struct Shared {
     routes: Mutex<Routes>,
     stderr: Arc<Mutex<Vec<u8>>>,
     next_id: AtomicU64,
+    /// How long [`Shared::call`] waits; [`ANSWER_DEADLINE`] but in tests.
+    deadline: Mutex<Duration>,
 }
 
 #[derive(Debug, Default)]
@@ -97,6 +105,7 @@ impl Client {
             routes: Mutex::new(Routes::default()),
             stderr: stderr_tail,
             next_id: AtomicU64::new(1),
+            deadline: Mutex::new(ANSWER_DEADLINE),
         });
 
         let (introduced, introduction) = mpsc::channel();
@@ -138,6 +147,14 @@ impl Client {
     /// What the agent said about itself and its machine.
     pub const fn hello(&self) -> &Hello {
         &self.hello
+    }
+
+    /// Wait `deadline` for each one-answer request instead of
+    /// [`ANSWER_DEADLINE`]: for a test of an agent that never answers.
+    #[must_use]
+    pub fn with_deadline(self, deadline: Duration) -> Self {
+        *lock(&self.shared.deadline) = deadline;
+        self
     }
 
     /// Why the connection ended, once it has: every request from then on
@@ -278,6 +295,15 @@ impl Shared {
             routes.open.insert(id, sender);
         }
         if let Err(error) = self.write(id, request) {
+            // An agent that died says why on stderr, and the reader fails
+            // every open request with that once its output ends: give it
+            // a moment to, rather than racing it with less to say.
+            let started = Instant::now();
+            while lock(&self.routes).closed.is_none()
+                && started.elapsed() < Duration::from_millis(500)
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
             let reason = with_stderr(
                 format!("could not reach the agent: {error}"),
                 &self.stderr,
@@ -290,15 +316,30 @@ impl Shared {
         (id, replies)
     }
 
-    /// Send `request` and wait for its one reply.
+    /// Send `request` and wait for its one reply, up to the deadline.
+    /// One that does not come in time is forgotten, route and all: a late
+    /// reply is dropped like one to a caller that stopped listening.
     fn call(&self, request: &Request) -> io::Result<Reply> {
-        let (_, replies) = self.open(request);
-        match replies.recv() {
+        let deadline = *lock(&self.deadline);
+        let (id, replies) = self.open(request);
+        match replies.recv_timeout(deadline) {
             Ok(Reply::Failed { kind, message }) => {
                 Err(io::Error::new(kind, message))
             }
             Ok(reply) => Ok(reply),
-            Err(_) => Err(io::Error::other("the agent connection closed")),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                lock(&self.routes).open.remove(&id);
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "the agent did not answer within {} s",
+                        deadline.as_secs_f32()
+                    ),
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(io::Error::other("the agent connection closed"))
+            }
         }
     }
 
@@ -700,4 +741,39 @@ fn forward_removal(replies: &Receiver<Reply>, events: &Sender<RemovalEvent>) {
 
 fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// An agent that introduces itself and then never answers: a call
+    /// gives up at its deadline and leaves no route behind.
+    #[test]
+    fn a_call_nobody_answers_ends_at_its_deadline_and_leaves_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut introduction = crate::protocol::preamble();
+        crate::wire::write_frame(
+            &mut introduction,
+            tag::HELLO,
+            &crate::serve::hello().encode(),
+        )
+        .unwrap();
+        let script = temp.path().join("introduction");
+        std::fs::write(&script, introduction).unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", &format!("cat '{}'; sleep 30", script.display())]);
+        let client = Client::connect(command)
+            .unwrap()
+            .with_deadline(Duration::from_millis(200));
+
+        let started = Instant::now();
+        let error = client.space(temp.path()).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5), "it waited");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            lock(&client.shared.routes).open.is_empty(),
+            "a route stayed"
+        );
+    }
 }

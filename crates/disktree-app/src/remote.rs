@@ -9,19 +9,21 @@
 //! removal guards on its own machine.
 //!
 //! The screens read a source on the UI thread, and a link can hang, so
-//! nothing here waits on the agent for long: free space is answered from
-//! the last reading while the next one is asked for, and a plan is asked
-//! once per set of marks, with a deadline.
+//! nothing the screens call waits on the agent: free space is answered
+//! from the last reading while the next one is asked for, and a plan is
+//! asked once per set of marks, "checking" until it lands. Each ask runs
+//! on a thread of its own, with the client's deadline, and every answer
+//! that lands bumps [`Remote::answers`] so the window knows to redraw.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use disktree_agent::{Client, Hello, PathInfo, SpaceReport};
 use disktree_core::removal::{Blocked, Plan, Target, TrashBackend};
@@ -29,14 +31,19 @@ use disktree_core::removal::{Blocked, Plan, Target, TrashBackend};
 /// Where the agent is installed, under the remote home directory.
 const AGENT_DIR: &str = ".cache/disktree";
 
-/// How long the UI thread waits for an answer it has none for yet: the
-/// first free-space reading of a path, a plan, what is at a root. A link
-/// on the same network answers in milliseconds.
-const DEADLINE: Duration = Duration::from_secs(3);
+/// How often a path's free space is asked for again. The screens ask on
+/// every tick; the agent is asked at most this often.
+const REFRESH: Duration = Duration::from_secs(1);
 
-/// The real disk of a `SparkOS` host, which `/` (a small overlay) is not;
-/// `/home` and the other big folders are binds of directories on it.
-const SPARKOS_DISK: &str = "/run/sparkos/host";
+/// How long a plan that could not be asked stands before it is asked
+/// again. Not cached past that: the next look at the review screen, or
+/// the next Delete, asks again.
+const RETRY: Duration = Duration::from_secs(2);
+
+/// What a target is kept back for while the agent judges it.
+const CHECKING: &str = "checking on ";
+
+use disktree_core::space::SPARKOS_DISK;
 
 /// What the command line asked to scan there.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,7 +80,9 @@ pub struct Remote {
     /// What connecting is doing now, for the scanning screen.
     stage: Mutex<Option<String>>,
     reports: Arc<Mutex<HashMap<PathBuf, Report>>>,
-    plan: Mutex<Option<CachedPlan>>,
+    plan: Arc<Mutex<PlanCache>>,
+    /// Bumped each time an answer lands, so the window knows to redraw.
+    answers: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Default)]
@@ -91,14 +100,33 @@ struct Link {
 struct Report {
     value: Option<SpaceReport>,
     asking: bool,
+    asked: Option<Instant>,
 }
 
-#[derive(Debug)]
-struct CachedPlan {
-    targets: Vec<Target>,
-    root: PathBuf,
+/// The plan for the last set of marks asked about.
+#[derive(Debug, Default)]
+struct PlanCache {
+    key: Option<PlanKey>,
+    state: PlanState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlanKey {
     generation: u64,
-    plan: Plan,
+    root: PathBuf,
+    targets: Vec<Target>,
+}
+
+#[derive(Debug, Default)]
+enum PlanState {
+    #[default]
+    Asking,
+    Answered(Plan),
+    /// Why it could not be asked, and when: kept for [`RETRY`] only.
+    Failed {
+        reason: String,
+        at: Instant,
+    },
 }
 
 impl Remote {
@@ -110,8 +138,15 @@ impl Remote {
             link: Mutex::new(Link::default()),
             stage: Mutex::new(None),
             reports: Arc::new(Mutex::new(HashMap::new())),
-            plan: Mutex::new(None),
+            plan: Arc::new(Mutex::new(PlanCache::default())),
+            answers: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// How many answers have landed: when it changes, what the screens
+    /// read from here may have too.
+    pub fn answers(&self) -> u64 {
+        self.answers.load(Ordering::Relaxed)
     }
 
     /// The agent's client: connected, or lost and failing every request.
@@ -203,31 +238,33 @@ impl Remote {
             .ok_or_else(|| format!("{} reports no home directory", self.host))
     }
 
-    /// What is at `path` there, or why that could not be asked.
+    /// What is at `path` there, or why that could not be asked. Blocks
+    /// up to the client's deadline: call it off the UI thread.
     pub fn path_info(&self, path: &Path) -> Result<PathInfo, String> {
         let client = self
             .client()
             .ok_or_else(|| format!("not connected to {}", self.host))?;
-        let path = path.to_path_buf();
-        ask(move || client.path_info(&path))
-            .ok_or_else(|| self.silent())?
-            .map_err(|error| error.to_string())
+        client.path_info(path).map_err(|error| error.to_string())
     }
 
-    /// The last free-space reading of `path`, asking for the next one.
-    /// The first time, it waits up to [`DEADLINE`] for it.
+    /// The last free-space reading of `path`, asking for the next one
+    /// when the last is older than [`REFRESH`]. Never waits: `None` until
+    /// the first reading lands.
     pub fn report(&self, path: &Path) -> Option<SpaceReport> {
         let client = self.client()?;
         let mut reports = lock(&self.reports);
         let report = reports.entry(path.to_path_buf()).or_default();
         let known = report.value.clone();
-        let asking = std::mem::replace(&mut report.asking, true);
-        drop(reports);
-        if asking {
+        if report.asking
+            || report.asked.is_some_and(|at| at.elapsed() < REFRESH)
+        {
             return known;
         }
-        let (sender, answer) = mpsc::channel();
+        report.asking = true;
+        report.asked = Some(Instant::now());
+        drop(reports);
         let reports = Arc::clone(&self.reports);
+        let answers = Arc::clone(&self.answers);
         let path = path.to_path_buf();
         let spawned = thread::Builder::new()
             .name("disktree-remote-space".into())
@@ -238,66 +275,101 @@ impl Remote {
                     let mut reports = lock(&reports);
                     let report = reports.entry(path).or_default();
                     report.asking = false;
-                    if value.is_some() {
-                        report.value.clone_from(&value);
+                    let changed = value.is_some() && report.value != value;
+                    if changed {
+                        report.value = value;
                     }
                     drop(reports);
-                    let _ = sender.send(value);
+                    if changed {
+                        answers.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             });
         if spawned.is_err() {
             lock(&self.reports).entry(path).or_default().asking = false;
-            return known;
         }
-        if known.is_some() {
-            return known;
-        }
-        answer.recv_timeout(DEADLINE).ok().flatten()
+        known
     }
 
-    /// The agent's plan for `targets`, asked once per set of marks. When
-    /// it cannot be asked, every target is refused with the reason: a
-    /// plan nobody judged removes nothing.
+    /// The agent's plan for `targets`, asked once per set of marks. Never
+    /// waits: until the answer lands, and when it cannot be asked, every
+    /// target is kept back with the reason, since a plan nobody judged
+    /// removes nothing. Only an answer is kept; a failure is asked again
+    /// after [`RETRY`].
     pub fn plan(&self, targets: &[Target], root: &Path) -> Plan {
         let link = lock(&self.link);
         let generation = link.generation;
         let client = link.connection.clone();
         drop(link);
-        let mut cached = lock(&self.plan);
-        if let Some(cached) = cached.as_ref()
-            && cached.generation == generation
-            && cached.root == root
-            && cached.targets == targets
-        {
-            return cached.plan.clone();
-        }
-        let asked =
-            client.ok_or_else(|| format!("not connected to {}", self.host));
-        let plan = asked.and_then(|client| {
-            let targets = targets.to_vec();
-            let root = root.to_path_buf();
-            ask(move || client.plan(&targets, &root))
-                .ok_or_else(|| self.silent())?
-                .map_err(|error| error.to_string())
-        });
-        let plan =
-            plan.unwrap_or_else(|reason| refuse_all(targets, root, &reason));
-        *cached = Some(CachedPlan {
-            targets: targets.to_vec(),
-            root: root.to_path_buf(),
+        let Some(client) = client else {
+            let reason = format!("not connected to {}", self.host);
+            return refuse_all(targets, root, &reason);
+        };
+        let key = PlanKey {
             generation,
-            plan: plan.clone(),
-        });
-        plan
+            root: root.to_path_buf(),
+            targets: targets.to_vec(),
+        };
+        let mut cache = lock(&self.plan);
+        if cache.key.as_ref() == Some(&key) {
+            match &cache.state {
+                PlanState::Answered(plan) => return plan.clone(),
+                PlanState::Asking => {
+                    return refuse_all(targets, root, &self.checking());
+                }
+                PlanState::Failed { reason, at } if at.elapsed() < RETRY => {
+                    return refuse_all(targets, root, reason);
+                }
+                PlanState::Failed { .. } => {}
+            }
+        }
+        cache.key = Some(key.clone());
+        cache.state = PlanState::Asking;
+        drop(cache);
+
+        let cache = Arc::clone(&self.plan);
+        let answers = Arc::clone(&self.answers);
+        let host = self.host.clone();
+        let spawned = thread::Builder::new()
+            .name("disktree-remote-plan".into())
+            .spawn(move || {
+                let state = match client.plan(&key.targets, &key.root) {
+                    Ok(plan) => PlanState::Answered(plan),
+                    Err(error) => PlanState::Failed {
+                        reason: format!("{host} could not judge it: {error}"),
+                        at: Instant::now(),
+                    },
+                };
+                let mut cache = lock(&cache);
+                // Marks changed meanwhile: that set has an ask of its own.
+                if cache.key.as_ref() == Some(&key) {
+                    cache.state = state;
+                }
+                drop(cache);
+                answers.fetch_add(1, Ordering::Relaxed);
+            });
+        if let Err(error) = spawned {
+            let reason = format!("could not ask {}: {error}", self.host);
+            lock(&self.plan).state = PlanState::Failed {
+                reason: reason.clone(),
+                at: Instant::now(),
+            };
+            return refuse_all(targets, root, &reason);
+        }
+        refuse_all(targets, root, &self.checking())
     }
 
-    fn silent(&self) -> String {
-        format!(
-            "{} did not answer within {} s",
-            self.host,
-            DEADLINE.as_secs()
-        )
+    fn checking(&self) -> String {
+        format!("{CHECKING}{}", self.host)
     }
+}
+
+/// Whether `plan` is still waiting for the agent's answer.
+#[cfg_attr(not(test), allow(dead_code, reason = "the tests wait on it"))]
+pub fn is_checking(plan: &Plan) -> bool {
+    plan.blocked
+        .iter()
+        .any(|blocked| blocked.reason.starts_with(CHECKING))
 }
 
 /// [`Remote::first_root`] for a host that said `hello`; `None` when the
@@ -333,21 +405,6 @@ fn refuse_all(targets: &[Target], root: &Path, reason: &str) -> Plan {
         })
         .collect();
     Plan::from_parts(Vec::new(), Vec::new(), blocked, root.to_path_buf(), 0, 0)
-}
-
-/// Run `call` on a thread of its own and wait for it up to [`DEADLINE`]:
-/// `None` when it is still waiting then.
-fn ask<T: Send + 'static>(
-    call: impl FnOnce() -> T + Send + 'static,
-) -> Option<T> {
-    let (sender, answer) = mpsc::channel();
-    thread::Builder::new()
-        .name("disktree-remote-ask".into())
-        .spawn(move || {
-            let _ = sender.send(call());
-        })
-        .ok()?;
-    answer.recv_timeout(DEADLINE).ok()
 }
 
 /// A failed start, said in terms of what to do about it.
@@ -777,6 +834,103 @@ mod tests {
             TrashBackend::Unavailable,
             "not connected"
         );
+    }
+
+    /// A remote played by a script: it introduces itself as an agent and
+    /// then runs `then`.
+    fn scripted(temp: &Path, then: &str) -> Remote {
+        let mut introduction = disktree_agent::protocol::preamble();
+        disktree_agent::wire::write_frame(
+            &mut introduction,
+            disktree_agent::protocol::tag::HELLO,
+            &disktree_agent::serve::hello().encode(),
+        )
+        .expect("hello");
+        std::fs::write(temp.join("hello"), introduction).expect("hello");
+        let agent = temp.join("agent");
+        std::fs::write(
+            &agent,
+            format!(
+                "#!/bin/sh\ncat '{}'\n{then}\n",
+                temp.join("hello").display()
+            ),
+        )
+        .expect("agent");
+        std::fs::set_permissions(
+            &agent,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+        let remote =
+            Remote::new("testhost".into(), Reach::Direct(agent), Ask::Default);
+        remote.connect().expect("connected");
+        remote
+    }
+
+    fn junk(path: &str) -> Target {
+        Target {
+            path: PathBuf::from(path),
+            bytes: 10,
+            is_dir: false,
+            hidden: false,
+        }
+    }
+
+    /// An agent that never answers holds up nothing the screens call:
+    /// the plan says it is checking and free space is not known yet, at
+    /// once, however long the agent takes.
+    #[test]
+    fn asks_never_wait_on_an_agent_that_does_not_answer() {
+        let temp = tempfile::tempdir().expect("temp");
+        let remote = scripted(temp.path(), "sleep 30");
+        let started = Instant::now();
+        let plan = remote.plan(&[junk("/srv/junk")], Path::new("/srv"));
+        assert!(is_checking(&plan), "{plan:?}");
+        assert!(plan.targets.is_empty(), "nothing acts unjudged");
+        assert!(remote.report(Path::new("/srv")).is_none());
+        let again = remote.plan(&[junk("/srv/junk")], Path::new("/srv"));
+        assert!(is_checking(&again), "one ask per set of marks");
+        assert!(started.elapsed() < Duration::from_millis(500), "it waited");
+    }
+
+    /// A plan the agent could not judge is not kept as its answer: it is
+    /// said for a moment, then asked again.
+    #[test]
+    fn a_plan_that_failed_is_asked_again() {
+        let temp = tempfile::tempdir().expect("temp");
+        // The real agent: it refuses a relative root without judging.
+        let agent = std::env::current_exe()
+            .ok()
+            .and_then(|exe| {
+                Some(exe.parent()?.parent()?.join("disktree-agent"))
+            })
+            .filter(|agent| agent.is_file());
+        let Some(agent) = agent else {
+            panic!("build the agent first: cargo build -p disktree-agent");
+        };
+        let remote =
+            Remote::new("testhost".into(), Reach::Direct(agent), Ask::Default);
+        remote.connect().expect("connected");
+        let targets = [junk("/srv/junk")];
+        let root = Path::new("relative");
+        let mut plan = remote.plan(&targets, root);
+        let started = Instant::now();
+        while is_checking(&plan) {
+            assert!(started.elapsed() < Duration::from_secs(10), "no answer");
+            std::thread::sleep(Duration::from_millis(5));
+            plan = remote.plan(&targets, root);
+        }
+        assert!(
+            plan.blocked[0].reason.contains("not an absolute path"),
+            "{plan:?}"
+        );
+        assert!(remote.answers() > 0, "the window hears of it");
+        std::thread::sleep(RETRY + Duration::from_millis(100));
+        assert!(
+            is_checking(&remote.plan(&targets, root)),
+            "asked again, not kept"
+        );
+        let _ = temp;
     }
 
     #[test]

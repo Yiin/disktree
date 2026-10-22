@@ -119,6 +119,16 @@ impl Source {
         }
     }
 
+    /// How many answers another machine has given since it connected; the
+    /// window redraws when this changes. Always 0 here, where every answer
+    /// is given at once.
+    pub fn answers(&self) -> u64 {
+        match self {
+            Self::Local => 0,
+            Self::Remote(remote) => remote.answers(),
+        }
+    }
+
     /// What connecting is doing, while it is: "Connecting to spark-1".
     pub fn stage(&self) -> Option<String> {
         match self {
@@ -157,7 +167,9 @@ impl Source {
     /// `root` in the form a widening walk recognises again, or as given
     /// when it cannot be resolved. Through dunce, so Windows gets
     /// `C:\Users\…` rather than the `\\?\C:\…` form nothing else is written
-    /// in.
+    /// in. On another machine it asks the agent and waits for the answer:
+    /// call it off the UI thread, as [`Self::is_dir`] and
+    /// [`Self::exists`].
     pub fn canonical(&self, root: PathBuf) -> PathBuf {
         match self {
             Self::Local => dunce::canonicalize(&root).unwrap_or(root),
@@ -226,7 +238,9 @@ impl Source {
     }
 
     /// Free space on the volume holding `path`, `None` when unreadable.
-    /// On another machine, the last reading, while the next is asked for.
+    /// On another machine, the last reading, while the next is asked for:
+    /// `None` until the first lands. So for [`Self::device`] and
+    /// [`Self::volume_root`].
     pub fn space(&self, path: &Path) -> Option<SpaceInfo> {
         match self {
             Self::Local => disktree_core::space::space_info(path).ok(),
@@ -323,7 +337,9 @@ impl Source {
     }
 
     /// What removing `targets` under `root` would do, with every guard
-    /// applied where the disk is.
+    /// applied where the disk is. On another machine every target is kept
+    /// back, "checking", until the agent's answer lands; see
+    /// [`Remote::plan`].
     pub fn plan(&self, targets: &[Target], root: &Path) -> Plan {
         match self {
             Self::Local => disktree_core::removal::plan(targets, root),

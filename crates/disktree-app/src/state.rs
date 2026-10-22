@@ -343,11 +343,15 @@ pub struct Disktree {
     pub cpu_threads: usize,
     pub tree: Option<Arc<Node>>,
     pub scan: Option<SourceScan>,
-    /// A remote source is being connected; the outcome arrives here. The
-    /// scan starts once it has.
-    pub connecting: Option<Receiver<Result<(), String>>>,
+    /// A remote source is being connected; the outcome arrives here, with
+    /// the first root resolved there when there was none yet. The scan
+    /// starts once it has.
+    pub connecting: Option<Receiver<Result<Option<PathBuf>, String>>>,
     /// The lost connection was said in the notice line, once.
     lost_told: bool,
+    /// The remote source's answer count last seen; see
+    /// [`Self::take_answers`].
+    answers_seen: u64,
     pub scan_epoch: u64,
     pub progress: ScanSnapshot,
     pub scan_error: Option<String>,
@@ -505,6 +509,7 @@ impl Disktree {
             scan: None,
             connecting: None,
             lost_told: false,
+            answers_seen: 0,
             scan_epoch: 0,
             progress: ScanSnapshot::default(),
             scan_error: None,
@@ -580,6 +585,9 @@ impl Disktree {
             scanned_at: now_seconds(),
         };
         Self::start_space_ticker(cx);
+        if !tree.source.is_local() {
+            Self::watch_answers(cx);
+        }
         // Another machine: what is there is known once it has answered,
         // and `connected` then does what follows for it.
         if !tree.source.is_ready() {
@@ -614,10 +622,14 @@ impl Disktree {
         self.scan_elapsed = None;
         let (sender, outcome) = mpsc::channel();
         let source = self.source.clone();
+        let first = self.root_path.as_os_str().is_empty();
         let spawned = std::thread::Builder::new()
             .name("disktree-connect".into())
             .spawn(move || {
-                let _ = sender.send(source.connect());
+                let outcome = source.connect().and_then(|()| {
+                    first.then(|| first_root(&source)).transpose()
+                });
+                let _ = sender.send(outcome);
             });
         if let Err(error) = spawned {
             self.scan_error = Some(format!("could not connect: {error}"));
@@ -667,7 +679,7 @@ impl Disktree {
             }
         };
         self.connecting = None;
-        match outcome.and_then(|()| self.connected_root()) {
+        match outcome.map(|first| self.connected_root(first)) {
             Ok(root) => {
                 self.lost_told = false;
                 self.set_root(root, cx);
@@ -684,20 +696,13 @@ impl Disktree {
     }
 
     /// The root to scan now that the source is connected: the one on
-    /// screen when reconnecting, else what the command line asked for,
-    /// resolved and checked there. The first time, what the host says
-    /// about itself replaces what was assumed before it answered.
-    fn connected_root(&mut self) -> Result<PathBuf, String> {
-        if !self.root_path.as_os_str().is_empty() {
-            return Ok(self.root_path.clone());
-        }
-        let root = self.source.canonical(self.source.first_root()?);
-        let shown = format!("{}:{}", self.source.name(), root.display());
-        match self.source.is_dir(&root) {
-            Ok(true) => {}
-            Ok(false) => return Err(format!("{shown} is not a directory")),
-            Err(error) => return Err(format!("cannot read {shown}: {error}")),
-        }
+    /// screen when reconnecting, else `first`, what the command line asked
+    /// for as resolved there. The first time, what the host says about
+    /// itself replaces what was assumed before it answered.
+    fn connected_root(&mut self, first: Option<PathBuf>) -> PathBuf {
+        let Some(root) = first else {
+            return self.root_path.clone();
+        };
         self.home = self.source.home();
         self.trash_backend = self.source.trash_backend();
         self.removal_mode = if self.trash_backend.is_available() {
@@ -705,7 +710,45 @@ impl Disktree {
         } else {
             RemovalMode::Permanent
         };
-        Ok(root)
+        root
+    }
+
+    /// Redraw when the remote source has new answers: a plan judged, a
+    /// free-space reading. Every 100 ms, a counter read; the asks run on
+    /// threads of their own and never wait on this.
+    fn watch_answers(cx: &Context<'_, Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                if this.update(cx, Self::take_answers).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Read again what the remote source has answered since the last look,
+    /// and redraw. Driven by the watch above, and by the tests.
+    pub(crate) fn take_answers(&mut self, cx: &mut Context<'_, Self>) {
+        let answers = self.source.answers();
+        if answers == self.answers_seen {
+            return;
+        }
+        self.answers_seen = answers;
+        if !self.root_path.as_os_str().is_empty() {
+            let root = self.root_path.clone();
+            self.space = self.source.space(&root);
+            if let Some(device) = self.source.device(&root) {
+                self.device = Some(device);
+            }
+            if let Some(disk) = self.source.volume_root(&root) {
+                self.disk_root = Some(disk);
+            }
+        }
+        cx.notify();
     }
 
     /// Build a view over a tree that is already known.
@@ -2289,7 +2332,9 @@ impl Disktree {
     /// The review screen's commit: move to the trash at once, or ask first for
     /// a permanent deletion, which cannot be undone.
     pub fn commit(&mut self, cx: &mut Context<'_, Self>) {
-        if self.plan().is_empty() {
+        let plan = self.plan();
+        if plan.is_empty() {
+            self.nothing_to_remove(&plan, cx);
             return;
         }
         match self.removal_mode {
@@ -2300,6 +2345,24 @@ impl Disktree {
                 cx.notify();
             }
         }
+    }
+
+    /// Say why a plan with nothing to act on does nothing: no marks, or
+    /// every mark kept back, with the first reason, which on another
+    /// machine may be that it is still judging them.
+    fn nothing_to_remove(&mut self, plan: &Plan, cx: &mut Context<'_, Self>) {
+        let notice = match plan.blocked.as_slice() {
+            [] => "nothing is marked".to_owned(),
+            [only] => format!("nothing can be removed: {}", only.reason),
+            [first, ..] => format!(
+                "nothing can be removed: all {} are kept back, the first \
+                 because {}",
+                plan.blocked.len(),
+                first.reason
+            ),
+        };
+        self.notice = Some((notice, Status::Warning));
+        cx.notify();
     }
 
     /// The alert dialog's `Delete`.
@@ -2362,8 +2425,7 @@ impl Disktree {
     pub fn begin_removal(&mut self, cx: &mut Context<'_, Self>) {
         let plan = self.plan();
         if plan.is_empty() {
-            self.notice = Some(("nothing is marked".into(), Status::Warning));
-            cx.notify();
+            self.nothing_to_remove(&plan, cx);
             return;
         }
         // This window quits once the prompt is answered yes, and quitting
@@ -3245,6 +3307,18 @@ const HEADER_REMS: f32 = 1.375;
 
 /// Height of the slim label row a deeper open directory keeps, in rem.
 const HEADER_INNER_REMS: f32 = 1.0;
+
+/// What the command line asked to scan on `source`, resolved and checked
+/// there. Asks the agent on another machine: call it off the UI thread.
+fn first_root(source: &Source) -> Result<PathBuf, String> {
+    let root = source.canonical(source.first_root()?);
+    let shown = format!("{}:{}", source.name(), root.display());
+    match source.is_dir(&root) {
+        Ok(true) => Ok(root),
+        Ok(false) => Err(format!("{shown} is not a directory")),
+        Err(error) => Err(format!("cannot read {shown}: {error}")),
+    }
+}
 
 /// A trail step's label: the directory's own name, or `/` for the root.
 fn crumb_label(path: &Path) -> String {
