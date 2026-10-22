@@ -386,12 +386,17 @@ agents in that folder nobody started for a week, so two disktree builds
 that reach one host keep each other's. The install runs in `sh` whatever
 the login shell is there. The agents are static Linux
 binaries for aarch64 and x86_64, and the app carries them:
-`make install` builds them first (`make agent`), which needs rustup with
+`make build`, `make run` and `make install` build them first (`make
+agent`), which needs rustup with
 both musl targets (`rustup target add aarch64-unknown-linux-musl
 x86_64-unknown-linux-musl`) and zig. A rustup and zig under
 `~/.local/share` are found without changing `PATH`; `RUSTUP_HOME`,
 `CARGO_HOME` and `ZIG` name others. A disktree built without them works
-here and says what to run when asked to scan another machine.
+here and says what to run when asked to scan another machine. An agent
+says which sources it was built from when it connects, and disktree
+refuses one built from other sources than its own: it would judge
+removals by older rules. `make agent` and a rebuild fix that, and the
+build warns when `target/agent` is behind.
 
 The removal rules run on the host, against its own mounts and home
 directory: the agent plans what it is asked to remove again and refuses

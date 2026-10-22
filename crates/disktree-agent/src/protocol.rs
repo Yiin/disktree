@@ -27,7 +27,15 @@ use crate::wire::{Decoder, Encoder, invalid};
 /// Bumped on any change to a message's layout; see [`preamble`].
 ///
 /// 2: git state, and what is at a path.
-pub const PROTOCOL: u32 = 2;
+/// 3: the agent's build in its hello, and a removal whose link was lost.
+pub const PROTOCOL: u32 = 3;
+
+/// The id of the sources this crate was built from; see `source_id.rs`.
+///
+/// An agent says it in its hello and a client checks it: an agent built
+/// from other sources, say before a fix to the removal guards, is refused
+/// even when it speaks the same protocol.
+pub const BUILD: &str = env!("DISKTREE_AGENT_BUILD");
 
 /// What an agent's output starts with: anything else on its stdout (a
 /// login banner, a shell error) is not an agent.
@@ -62,6 +70,8 @@ pub struct Hello {
     pub protocol: u32,
     /// The agent's crate version.
     pub version: String,
+    /// The id of the sources the agent was built from; see [`BUILD`].
+    pub build: String,
     /// `std::env::consts::ARCH`: `aarch64`, `x86_64`.
     pub arch: String,
     /// `std::env::consts::OS`.
@@ -190,6 +200,7 @@ impl Hello {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Encoder::new();
         out.str(&self.version);
+        out.str(&self.build);
         out.str(&self.arch);
         out.str(&self.os);
         out.str(&self.hostname);
@@ -209,6 +220,7 @@ impl Hello {
     pub fn decode(payload: &[u8], protocol: u32) -> io::Result<Self> {
         let mut input = Decoder::new(payload);
         let version = input.string()?;
+        let build = input.string()?;
         let arch = input.string()?;
         let os = input.string()?;
         let hostname = input.string()?;
@@ -228,6 +240,7 @@ impl Hello {
         Ok(Self {
             protocol,
             version,
+            build,
             arch,
             os,
             hostname,

@@ -36,6 +36,7 @@ pub fn hello() -> Hello {
     Hello {
         protocol: PROTOCOL,
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        build: crate::protocol::BUILD.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
         os: std::env::consts::OS.to_owned(),
         hostname: hostname(),

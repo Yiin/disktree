@@ -28,7 +28,8 @@ use disktree_core::tree::Node;
 use ruzstd::decoding::StreamingDecoder;
 
 use crate::protocol::{
-    Hello, PROTOCOL, PathInfo, Reply, Request, SpaceReport, read_preamble, tag,
+    BUILD, Hello, PROTOCOL, PathInfo, Reply, Request, SpaceReport,
+    read_preamble, tag,
 };
 use crate::tree_codec::{CHUNK, TreeBuilder};
 use crate::wire::{invalid, read_frame};
@@ -42,6 +43,10 @@ const HANDSHAKE: Duration = Duration::from_secs(30);
 /// stuck, and the caller gets an error instead of a thread parked for
 /// good.
 const ANSWER_DEADLINE: Duration = Duration::from_secs(15);
+
+/// What to do about an agent from other sources than this client.
+const STALE: &str =
+    "this disktree carries a stale agent; run make agent and rebuild";
 
 /// How much of the agent's stderr is kept for an error message: the tail
 /// of an ssh failure or a crash, not a log.
@@ -435,13 +440,25 @@ fn handshake(stdout: &mut impl Read) -> io::Result<Hello> {
             io::ErrorKind::Unsupported,
             format!(
                 "the agent speaks protocol {protocol} and this disktree \
-                 speaks protocol {PROTOCOL}: they are from different \
-                 releases, so install the matching agent"
+                 speaks protocol {PROTOCOL}: {STALE}"
             ),
         ));
     }
     match read_frame(stdout)? {
-        Some((tag::HELLO, payload)) => Hello::decode(&payload, protocol),
+        Some((tag::HELLO, payload)) => {
+            let hello = Hello::decode(&payload, protocol)?;
+            if hello.build != BUILD {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "the agent was built from other sources ({}) than \
+                         this disktree ({BUILD}): {STALE}",
+                        hello.build
+                    ),
+                ));
+            }
+            Ok(hello)
+        }
         Some((other, _)) => {
             Err(invalid(format!("the agent began with message {other}")))
         }

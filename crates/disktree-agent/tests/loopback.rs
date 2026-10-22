@@ -385,6 +385,41 @@ fn another_protocol_is_a_clear_error_not_a_hang() {
     );
 }
 
+/// An agent from other sources than this client, as one left in
+/// target/agent from before a fix: refused even at the same protocol.
+#[cfg(unix)]
+#[test]
+fn an_agent_built_from_other_sources_is_refused() {
+    let temp = TempDir::new().unwrap();
+    let mut hello = disktree_agent::serve::hello();
+    hello.build = "0123456789abcdef".into();
+    let mut introduction = disktree_agent::protocol::preamble();
+    disktree_agent::wire::write_frame(
+        &mut introduction,
+        disktree_agent::protocol::tag::HELLO,
+        &hello.encode(),
+    )
+    .unwrap();
+    let script = temp.path().join("introduction");
+    fs::write(&script, introduction).unwrap();
+    let error = fake_agent(&format!("cat '{}'; sleep 30", script.display()))
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    let message = error.to_string();
+    assert!(message.contains("0123456789abcdef"), "{message}");
+    assert!(
+        message.contains(
+            "this disktree carries a stale agent; run make agent and rebuild"
+        ),
+        "{message}"
+    );
+    assert_eq!(
+        agent().hello().build,
+        disktree_agent::protocol::BUILD,
+        "the agent built beside this test is current"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_shell_banner_is_not_an_agent() {

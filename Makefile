@@ -44,10 +44,16 @@ help:
 	@echo "  make fmt         format in place"
 	@echo "  make clean       cargo clean"
 
+# The agents first on Linux: the build embeds whatever is in target/agent,
+# and the app refuses an agent built from other sources than its own.
+ifneq ($(UNAME),Darwin)
+AGENTS_FIRST = agent
+endif
+
 # Always ask cargo: it is incremental and knows every source file, where a
 # make file-target would only compare the binary against the manifest and
 # happily install a stale build.
-build:
+build: $(AGENTS_FIRST)
 	$(CARGO) build --release
 
 run: build
@@ -90,10 +96,9 @@ uninstall:
 	@if [ -L "$(BINDIR)/disktree" ]; then rm -f "$(BINDIR)/disktree"; fi
 	@echo "removed"
 else
-# Agents first: the build embeds them, and a disktree without them cannot
-# scan another machine.
-install: agent
-	$(MAKE) build
+# Agents first, through build: the build embeds them, and a disktree
+# without them cannot scan another machine.
+install: build
 	install -d $(BINDIR) $(APPDIR) $(ICONDIR)
 	install -m755 $(TARGET) $(BINDIR)/disktree
 	install -m644 $(ICON) $(ICONDIR)/disktree.svg

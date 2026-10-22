@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+include!("../disktree-agent/source_id.rs");
+
 /// The architectures `cargo xtask agent` builds, as `uname -m` names them.
 const AGENTS: [&str; 2] = ["aarch64", "x86_64"];
 
@@ -17,6 +19,7 @@ fn embed_agents() {
     // build. So the folder is made if it is missing.
     let _ = std::fs::create_dir_all(&dir);
     println!("cargo:rerun-if-changed={}", dir.display());
+    warn_if_stale(&manifest.join("../.."), &dir);
     for arch in AGENTS {
         println!("cargo:rustc-check-cfg=cfg(agent_{arch})");
         let agent: &Path = &dir.join(format!("disktree-agent-{arch}"));
@@ -28,6 +31,27 @@ fn embed_agents() {
                 agent.display()
             );
         }
+    }
+}
+
+/// Warn when the agents in `dir` were built from other sources than the
+/// ones here: connecting with one would be refused, and `make agent`
+/// fixes it now. Agents with no record are left to that refusal too.
+fn warn_if_stale(root: &Path, dir: &Path) {
+    for source in AGENT_SOURCES {
+        println!("cargo:rerun-if-changed={}", root.join(source).display());
+    }
+    let built = std::fs::read_to_string(dir.join("build-id"));
+    let current = agent_source_id(root);
+    let any = AGENTS
+        .iter()
+        .any(|arch| dir.join(format!("disktree-agent-{arch}")).is_file());
+    if any && built.ok().as_deref().map(str::trim) != Some(current.as_str()) {
+        println!(
+            "cargo:warning=the agents in target/agent were built from other \
+             sources than these ({current}); run `make agent` and build \
+             again, or connecting to another machine is refused"
+        );
     }
 }
 

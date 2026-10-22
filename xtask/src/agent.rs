@@ -70,6 +70,23 @@ pub fn agent(cargo: &str) -> Result<(), String> {
             .len();
         println!("{}  {size} bytes  sha256 {}", out.display(), sha256(&out)?);
     }
+    write_build_id()
+}
+
+include!("../../crates/disktree-agent/source_id.rs");
+
+/// Where the id of the sources the agents in [`OUT`] were built from is
+/// written, for the app's build script to compare with its own.
+const BUILD_ID: &str = "target/agent/build-id";
+
+/// Write [`BUILD_ID`]. The agents carry the same id themselves and say it
+/// in their hello, where the client refuses one that differs; this lets
+/// the build warn before that.
+fn write_build_id() -> Result<(), String> {
+    let id = agent_source_id(Path::new("."));
+    fs::write(BUILD_ID, format!("{id}\n"))
+        .map_err(|err| format!("could not write {BUILD_ID}: {err}"))?;
+    println!("{BUILD_ID}  {id}");
     Ok(())
 }
 
