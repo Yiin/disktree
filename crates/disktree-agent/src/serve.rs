@@ -38,9 +38,11 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 const REMOVAL_EVERY: Duration = Duration::from_millis(10);
 
 /// How long the agent waits for any frame from the client before it takes
-/// the client for gone. The client pings every 5 s; four of those missed
-/// is a dead link, not a busy one, since pings are sent and read on
-/// threads that no scan or transfer holds up.
+/// the client for gone.
+///
+/// The client pings every 5 s; four of those missed is a dead link, not a
+/// busy one, since pings are sent and read on threads that no scan or
+/// transfer holds up.
 pub const SILENCE: Duration = Duration::from_secs(20);
 
 /// What this machine says about itself.
