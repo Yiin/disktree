@@ -354,6 +354,10 @@ fn parse_args_with_power(
             "--disk and a PATH cannot be combined"
         );
         let ask = match path {
+            Some(path) if remote::names_a_user(&path) => anyhow::bail!(
+                "{host}:{}: ~user is not supported; give the full path",
+                path.display()
+            ),
             Some(path) => Ask::Path(path),
             None if disk => Ask::Disk,
             None => Ask::Default,
@@ -680,6 +684,16 @@ mod argument_tests {
         assert_eq!(remote.reach, Reach::Ssh { sudo: false });
 
         assert!(args(&["-D", "spark-1:/srv"]).is_err());
+        // scp reads `~other` as that user's home; disktree does not guess.
+        for path in ["spark-1:~other/x", "spark-1:~other"] {
+            let error = args(&[path]).expect_err(path).to_string();
+            assert!(error.contains("~user is not supported"), "{error}");
+        }
+        let mine = args(&["spark-1:~/x"]).expect("own home");
+        let Source::Remote(remote) = &mine.source else {
+            panic!("not remote: {mine:?}");
+        };
+        assert_eq!(remote.ask, Ask::Path(PathBuf::from("~/x")));
         assert!(args(&["--sudo", "."]).is_err(), "sudo is for a host");
         let here = args(&["."]).expect("local");
         assert!(here.source.is_local());

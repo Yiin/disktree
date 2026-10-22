@@ -420,6 +420,19 @@ fn first_root(ask: &Ask, hello: &Hello) -> Option<PathBuf> {
     })
 }
 
+/// Whether `path` starts at another user's home, `~user`, as scp reads
+/// it. Refused on the command line: the agent would have to look the
+/// user up, and taken as a plain name it would be a folder in one's own
+/// home.
+pub fn names_a_user(path: &Path) -> bool {
+    match path.components().next() {
+        Some(std::path::Component::Normal(first)) => {
+            first != "~" && first.to_string_lossy().starts_with('~')
+        }
+        _ => false,
+    }
+}
+
 /// The whole disk `home` is on, as `-D` scans it. On `SparkOS` that is
 /// [`SPARKOS_DISK`]: `/home` is a bind of a folder on it, and the mounts
 /// above home show only the bind.
@@ -711,10 +724,28 @@ fn install_with(
     let name = agent_name(agent);
     if again || !probe.present.contains(&name) {
         stage(Stage::Installing);
-        shell.run_script(&install_script(&name, agent.len()), agent)?;
+        let said =
+            shell.run_script(&install_script(&name, agent.len()), agent)?;
+        finished(&said)?;
     }
     stage(Stage::Starting);
     Ok(format!("{AGENT_DIR}/{name}"))
+}
+
+/// What the install script says last, on a line of its own, once the
+/// agent is in place.
+const INSTALLED: &str = "disktree-agent-installed";
+
+/// Whether the install script said [`INSTALLED`]. A script that never ran
+/// exits 0 too: without `dd` there, the reader hands `eval` nothing.
+fn finished(said: &str) -> Result<(), String> {
+    if said.lines().any(|line| line.trim() == INSTALLED) {
+        Ok(())
+    } else {
+        Err("the install script there did not run to its end; it needs \
+             sh, dd, cat, wc, chmod, mv and find"
+            .into())
+    }
 }
 
 /// How long an agent nobody started stays. Each start touches the agent,
@@ -726,8 +757,10 @@ const STALE_DAYS: u32 = 7;
 /// make it executable and move it into place in one step, so a cut
 /// connection never leaves a half agent under the real name. Then remove
 /// the agents nobody started for [`STALE_DAYS`]: plain files named
-/// `agent-*` in that folder, nothing else. A cleanup that fails costs
-/// nothing; the agent is already in place.
+/// `agent-*` in that folder, nothing else; and the partial uploads of
+/// installs whose shell was killed before its `trap` ran, a day on, when
+/// no install still writes them. A cleanup that fails costs nothing; the
+/// agent is already in place. Ends with [`INSTALLED`].
 fn install_script(name: &str, length: usize) -> String {
     // `-mtime +N` counts whole days past N.
     let stale = STALE_DAYS - 1;
@@ -747,6 +780,9 @@ chmod 755 \"$part\"
 mv -f \"$part\" \"$dir/{name}\"
 find \"$dir\" -maxdepth 1 -type f -name 'agent-*' ! -name '{name}' \\
   -mtime +{stale} -exec rm -f {{}} \\; 2>/dev/null || true
+find \"$dir\" -maxdepth 1 -type f -name '.agent-*.*' -mtime +0 \\
+  -exec rm -f {{}} \\; 2>/dev/null || true
+echo {INSTALLED}
 "
     )
 }
@@ -822,6 +858,21 @@ mod tests {
             .expect("age it");
         std::fs::write(dir.join("agent-fedcba9876543210"), "in use")
             .expect("in use");
+        // A partial upload whose shell was killed two days ago, and one
+        // another install is writing now.
+        let abandoned = dir.join(".agent-0123456789abcdef.4242");
+        std::fs::write(&abandoned, "half").expect("abandoned");
+        std::fs::File::options()
+            .write(true)
+            .open(&abandoned)
+            .and_then(|file| {
+                file.set_modified(
+                    std::time::SystemTime::now() - Duration::from_hours(2 * 24),
+                )
+            })
+            .expect("age it");
+        let writing = dir.join(".agent-fedcba9876543210.4343");
+        std::fs::write(&writing, "half").expect("writing");
         std::fs::write(dir.join("notes.txt"), "keep").expect("notes");
         std::os::unix::fs::symlink(
             home.path().join("elsewhere"),
@@ -848,14 +899,42 @@ mod tests {
         assert!(dir.join("notes.txt").exists(), "not an agent");
         assert!(dir.join("agent-folder").is_dir(), "not a file");
         assert!(dir.join("agent-link").symlink_metadata().is_ok(), "a link");
+        assert!(!abandoned.exists(), "an abandoned partial upload");
+        assert!(writing.exists(), "another install's upload in flight");
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .expect("listing")
             .flatten()
-            .filter(|entry| {
-                entry.file_name().to_string_lossy().starts_with('.')
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+                    && *path != writing
             })
             .collect();
-        assert!(leftovers.is_empty(), "a partial upload was left behind");
+        assert!(leftovers.is_empty(), "this upload was left: {leftovers:?}");
+    }
+
+    /// A host without `dd` reads no script, and its shell exits 0 having
+    /// done nothing: the missing marker says the install did not run.
+    #[test]
+    fn an_install_that_never_ran_is_a_failure() {
+        let home = tempfile::tempdir().expect("home");
+        let shell = Shell::Local {
+            home: home.path().to_path_buf(),
+        };
+        let said = shell
+            .run(
+                "eval \"$(no-such-dd bs=1 count=5 2>/dev/null)\"",
+                b"echo hi",
+            )
+            .expect("the shell exits 0");
+        let error = finished(&said).expect_err("not installed");
+        assert!(error.contains("did not run to its end"), "{error}");
+
+        let said = shell
+            .run_script(&install_script(&agent_name(FAKE), FAKE.len()), FAKE)
+            .expect("installed");
+        assert_eq!(finished(&said), Ok(()));
     }
 
     #[test]
@@ -1079,11 +1158,6 @@ mod tests {
         assert_eq!(
             first_root(&Ask::Path("~/models".into()), &plain),
             Some(PathBuf::from("/home/me/models"))
-        );
-        assert_eq!(
-            first_root(&Ask::Path("~other/x".into()), &plain),
-            Some(PathBuf::from("/home/me/~other/x")),
-            "another user's home is not looked up"
         );
         assert_eq!(first_root(&Ask::Default, &hello(None, &[])), None);
     }
