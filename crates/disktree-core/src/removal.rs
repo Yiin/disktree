@@ -170,10 +170,9 @@ fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
     for target in targets {
         let path = normalize(&target.path);
         let reason =
-            refuse(&path, &root, home.as_ref(), &mounts.points, &mounts.media)
-                .or_else(|| {
-                    linked(&path, &root, real_root.as_deref(), home.as_ref())
-                });
+            refuse_with(&path, &root, home.as_ref(), mounts).or_else(|| {
+                linked(&path, &root, real_root.as_deref(), home.as_ref())
+            });
         if let Some(reason) = reason {
             plan.blocked.push(Blocked {
                 path: target.path.clone(),
@@ -432,12 +431,44 @@ impl Home {
     }
 }
 
+/// [`refuse_with`] for a mount table that has no disk under `/run` but
+/// the media in `media`.
+#[cfg(test)]
 fn refuse(
     path: &Path,
     root: &Path,
     home: Option<&Home>,
     mounts: &[PathBuf],
     media: &[PathBuf],
+) -> Option<String> {
+    refuse_judged(path, root, home, mounts, media, &[])
+}
+
+/// Why `path` may not be removed from the tree scanned at `root`, judged
+/// against `mounts`; `None` when it may.
+fn refuse_with(
+    path: &Path,
+    root: &Path,
+    home: Option<&Home>,
+    mounts: &MountTable,
+) -> Option<String> {
+    refuse_judged(
+        path,
+        root,
+        home,
+        &mounts.points,
+        &mounts.media,
+        &mounts.run_disks,
+    )
+}
+
+fn refuse_judged(
+    path: &Path,
+    root: &Path,
+    home: Option<&Home>,
+    mounts: &[PathBuf],
+    media: &[PathBuf],
+    run_disks: &[RunDisk],
 ) -> Option<String> {
     let key = guard_key(path);
     let root_key = guard_key(root);
@@ -493,9 +524,19 @@ fn refuse(
             && on_media(&key, mounts, media)
             && fs::canonicalize(path).is_ok_and(|real| real == path))
     {
-        return Some(format!(
-            "part of the system under {system}: {SYSTEM_TOOLS}"
-        ));
+        let on_disk = (system == "/run")
+            .then(|| on_run_disk(&key, mounts, run_disks, home_key))
+            .flatten()
+            .filter(|_| fs::canonicalize(path).is_ok_and(|real| real == path));
+        match on_disk {
+            Some(Ok(())) => {}
+            Some(Err(reason)) => return Some(reason),
+            None => {
+                return Some(format!(
+                    "part of the system under {system}: {SYSTEM_TOOLS}"
+                ));
+            }
+        }
     }
     if let Some(system) = system_tree_below(&key) {
         return Some(format!(
@@ -616,6 +657,7 @@ const MOUNTS_FRESH: std::time::Duration = std::time::Duration::from_secs(2);
 struct MountTable {
     points: Vec<PathBuf>,
     media: Vec<PathBuf>,
+    run_disks: Vec<RunDisk>,
     /// The table itself where the platform keeps one, which tells the
     /// scanned volume from another for the meter's projection. `None` where
     /// there is none to read, and the platform's own device test answers.
@@ -631,14 +673,126 @@ fn read_mount_table() -> MountTable {
         return MountTable {
             points: views.iter().map(|mount| guard_key(&mount.point)).collect(),
             media: media_roots(&views),
+            run_disks: run_disks(&views),
             mounts,
         };
     }
     MountTable {
         points: read_mount_points(),
         media: Vec::new(),
+        run_disks: Vec::new(),
         mounts,
     }
+}
+
+/// A real disk mounted whole under `/run`, and where else its folders are
+/// mounted. `SparkOS` keeps the machine's persistent root disk at
+/// `/run/sparkos/host` and binds `/home`, `/srv`, `/var/lib/docker` and
+/// others out of it. What is on it is judged by what it is to the system
+/// using it, not by the `/run` it happens to be reached through.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunDisk {
+    point: PathBuf,
+    /// Each other mount of the same filesystem outside `/run`: the folder
+    /// of the filesystem it shows, and where.
+    binds: Vec<(PathBuf, PathBuf)>,
+}
+
+/// The disks [`on_run_disk`] judges: block devices with a disk filesystem,
+/// mounted whole under `/run` but outside `/run/media`, seen once at that
+/// point. Missing information leaves a disk out, and the `/run` guard on.
+fn run_disks(mounts: &[crate::space::MountView]) -> Vec<RunDisk> {
+    mounts
+        .iter()
+        .filter(|mount| {
+            mount.point.starts_with("/run")
+                && mount.point != Path::new("/run")
+                && !mount.point.starts_with("/run/media")
+                && mounts
+                    .iter()
+                    .filter(|other| other.point == mount.point)
+                    .count()
+                    == 1
+                && mount.fs_root == Path::new("/")
+                && mount.source.starts_with("/dev/")
+                && matches!(
+                    mount.fstype.as_str(),
+                    "ext2" | "ext3" | "ext4" | "btrfs" | "xfs" | "f2fs"
+                )
+        })
+        .map(|disk| RunDisk {
+            point: guard_key(&disk.point),
+            binds: mounts
+                .iter()
+                .filter(|other| {
+                    other.device == disk.device
+                        && !other.point.starts_with("/run")
+                })
+                .map(|other| (other.fs_root.clone(), guard_key(&other.point)))
+                .collect(),
+        })
+        .collect()
+}
+
+/// For a path keyed `key` under a disk from [`run_disks`] (and not the
+/// disk's own top, nor under a mount nested in it): `Ok` when it may go,
+/// judged where it is on that disk and at every bind that shows it.
+/// Refused when any of those is part of the system, holds part of it or
+/// the home directory, or is itself where a bind is mounted. `None` when
+/// the path is on no such disk.
+fn on_run_disk(
+    key: &Path,
+    mounts: &[PathBuf],
+    disks: &[RunDisk],
+    home: Option<&Path>,
+) -> Option<Result<(), String>> {
+    // Nested mounts do not inherit their parent's exception.
+    let point = mounts
+        .iter()
+        .filter(|point| key.starts_with(point))
+        .max_by_key(|point| point.components().count())?;
+    let disk = disks.iter().find(|disk| &disk.point == point)?;
+    let inside = Path::new("/").join(key.strip_prefix(point).ok()?);
+    if inside == Path::new("/") {
+        return None;
+    }
+    let mut views = vec![inside.clone()];
+    for (shown, at) in &disk.binds {
+        if let Ok(rest) = inside.strip_prefix(shown) {
+            if rest.as_os_str().is_empty() {
+                return Some(Err(format!(
+                    "{} is mounted from it: removing it would empty that \
+                     mount",
+                    at.display()
+                )));
+            }
+            views.push(at.join(rest));
+        }
+        if shown.starts_with(&inside) {
+            return Some(Err(format!(
+                "it holds what is mounted at {}",
+                at.display()
+            )));
+        }
+    }
+    for view in &views {
+        if let Some(system) = system_tree(view, home) {
+            return Some(Err(format!(
+                "part of the system under {system} on this disk: \
+                 {SYSTEM_TOOLS}"
+            )));
+        }
+        if let Some(system) = system_tree_below(view) {
+            return Some(Err(format!(
+                "it contains {system} on this disk, which is part of the \
+                 system"
+            )));
+        }
+        if home.is_some_and(|home| home.starts_with(view)) {
+            return Some(Err("it contains the home directory".into()));
+        }
+    }
+    Some(Ok(()))
 }
 
 /// Only real disks mounted by the desktop under /run/media qualify. A
@@ -1088,19 +1242,14 @@ fn run(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        // The /run/media exception must still hold when removal starts;
-        // a disk may have been unmounted since the review was displayed.
+        // The /run exceptions, for media and for a disk mounted there,
+        // must still hold when removal starts; a disk may have been
+        // unmounted since the review was displayed.
         let reason = target
             .path
-            .starts_with("/run/media")
+            .starts_with("/run")
             .then(|| {
-                refuse(
-                    &target.path,
-                    &plan.root,
-                    home.as_ref(),
-                    &mounts.points,
-                    &mounts.media,
-                )
+                refuse_with(&target.path, &plan.root, home.as_ref(), &mounts)
             })
             .flatten()
             .or_else(|| mounted(&target.path, &mounts.points))
@@ -1683,6 +1832,80 @@ mod tests {
         assert!(media_roots(&[]).is_empty());
     }
 
+    /// `SparkOS`, as spark-2 mounts it: the root disk at /run/sparkos/host,
+    /// its folders bound back where the system expects them, and docker's
+    /// overlays mounted inside one of them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_disk_mounted_under_run_is_judged_as_its_system_sees_it() {
+        let views = crate::space::parse_mountinfo(
+            "33 39 0:29 / /run rw - tmpfs tmpfs rw\n\
+             34 33 259:2 / /run/sparkos/host rw - ext4 /dev/nvme0n1p2 rw\n\
+             36 33 0:30 / /run/sparkos/rw rw - tmpfs tmpfs rw\n\
+             39 2 0:31 / / rw - overlay overlay rw\n\
+             59 39 259:2 /home /home rw - ext4 /dev/nvme0n1p2 rw\n\
+             61 39 259:2 /root /root rw - ext4 /dev/nvme0n1p2 rw\n\
+             63 39 259:2 /srv /srv rw - ext4 /dev/nvme0n1p2 rw\n\
+             67 39 259:2 /var/lib/docker /var/lib/docker rw - ext4 \
+             /dev/nvme0n1p2 rw\n\
+             77 39 259:2 /var/log /var/log rw - ext4 /dev/nvme0n1p2 rw\n\
+             90 67 0:50 / /var/lib/docker/overlay2/x/merged rw - overlay \
+             overlay rw\n\
+             91 34 0:50 / /run/sparkos/host/var/lib/docker/overlay2/x/merged \
+             rw - overlay overlay rw\n",
+        );
+        let disks = run_disks(&views);
+        assert_eq!(disks.len(), 1, "{disks:?}");
+        assert_eq!(disks[0].point, PathBuf::from("/run/sparkos/host"));
+        let points: Vec<_> =
+            views.iter().map(|view| guard_key(&view.point)).collect();
+        let home = Path::new("/home/me");
+        let judge = |path: &str| {
+            on_run_disk(Path::new(path), &points, &disks, Some(home))
+        };
+        for path in [
+            "/run/sparkos/host/home/me/models",
+            "/run/sparkos/host/home/other/cache",
+            "/run/sparkos/host/srv/data",
+            "/run/sparkos/host/var/log/old.log",
+            "/run/sparkos/host/images",
+            "/run/sparkos/host/raid/scratch",
+        ] {
+            assert_eq!(judge(path), Some(Ok(())), "{path}");
+        }
+        for path in [
+            // System trees, through the disk and through a bind.
+            "/run/sparkos/host/usr/lib",
+            "/run/sparkos/host/etc",
+            "/run/sparkos/host/var/lib/docker/volumes/v",
+            "/run/sparkos/host/var",
+            // Where a bind comes from, and what holds one.
+            "/run/sparkos/host/home",
+            "/run/sparkos/host/srv",
+            // The home directory, by where it is on the disk.
+            "/run/sparkos/host/home/me",
+        ] {
+            assert!(matches!(judge(path), Some(Err(_))), "{path}");
+        }
+        for path in [
+            "/run/sparkos/host",
+            "/run/sparkos/host/var/lib/docker/overlay2/x/merged/file",
+            "/run/sparkos/rw/upper/file",
+            "/run/user/1000/file",
+        ] {
+            assert_eq!(judge(path), None, "{path}");
+        }
+        assert!(
+            run_disks(&crate::space::parse_mountinfo(
+                "33 39 0:29 / /run rw - tmpfs tmpfs rw\n\
+                 34 33 0:40 / /run/sparkos/host rw - tmpfs tmpfs rw\n\
+                 35 33 259:3 /sub /run/bound rw - ext4 /dev/sdb rw\n"
+            ))
+            .is_empty(),
+            "only a real disk, mounted whole"
+        );
+    }
+
     /// Run in a private mount namespace with the fixture described in
     /// scripts/test-linux-mounts.sh. Never changes the host's mount table.
     #[cfg(target_os = "linux")]
@@ -1807,6 +2030,7 @@ mod tests {
                 .map(|mount| guard_key(&mount.point))
                 .collect(),
             media: Vec::new(),
+            run_disks: Vec::new(),
             mounts: Some(crate::space::parse_mounts(table)),
         };
         let marked = [
