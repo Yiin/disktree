@@ -2285,13 +2285,7 @@ fn live_remote_scan(cx: &mut TestAppContext) {
     let remote = Remote::new(host, Reach::Ssh { sudo }, Ask::Default);
     let source = Source::Remote(std::sync::Arc::new(remote));
     let (view, cx) = cx.add_window_view(move |_, cx| {
-        Disktree::with_source(
-            source,
-            PathBuf::new(),
-            ScanOptions::default(),
-            3,
-            cx,
-        )
+        Disktree::with_source(source, PathBuf::new(), live_options(), 3, cx)
     });
     finish_connect(&view, cx);
     let connected = started.elapsed();
@@ -2375,6 +2369,18 @@ fn live_remote_scan(cx: &mut TestAppContext) {
     }
 }
 
+/// The live tests' scan options: `DISKTREE_LIVE_DEPTH` stops the scan at
+/// that depth, so a plan can be asked on a host with no memory to spare
+/// for a whole disk; a plan is judged on the host whatever was scanned.
+fn live_options() -> ScanOptions {
+    ScanOptions {
+        max_depth: std::env::var("DISKTREE_LIVE_DEPTH")
+            .ok()
+            .map(|depth| depth.parse().expect("DISKTREE_LIVE_DEPTH")),
+        ..ScanOptions::default()
+    }
+}
+
 /// A real removal, headless: `DISKTREE_LIVE_HOST=spark-2`,
 /// `DISKTREE_LIVE_ROOT`, the folder to scan there, and
 /// `DISKTREE_LIVE_MARK`, the one name in it to mark, removed through the
@@ -2400,13 +2406,7 @@ fn live_remote_removal(cx: &mut TestAppContext) {
     let remote = Remote::new(host, Reach::Ssh { sudo }, Ask::Path(root));
     let source = Source::Remote(std::sync::Arc::new(remote));
     let (view, cx) = cx.add_window_view(move |_, cx| {
-        Disktree::with_source(
-            source,
-            PathBuf::new(),
-            ScanOptions::default(),
-            3,
-            cx,
-        )
+        Disktree::with_source(source, PathBuf::new(), live_options(), 3, cx)
     });
     let focus = view.read_with(cx, |app, _| app.focus.clone());
     cx.update(|window, cx| window.focus(&focus, cx));
