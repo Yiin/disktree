@@ -302,6 +302,71 @@ fn a_permanent_deletion_asks_in_an_alert_dialog_then_removes(
     );
 }
 
+/// A removal whose link is lost before its end says the outcome is
+/// unknown, with no counts, keeps the marks for the rescan, and does not
+/// scan into the lost connection.
+#[gpui_kit::test]
+fn a_removal_whose_link_is_lost_says_the_outcome_is_unknown(
+    cx: &mut TestAppContext,
+) {
+    use crate::source::SourceRemoval;
+    use disktree_core::removal::RemovalEvent;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let junk = temp.path().join("junk");
+    let epoch = update(&view, cx, |app, cx| {
+        let index = app
+            .tree()
+            .and_then(|tree| {
+                tree.children
+                    .iter()
+                    .position(|child| &*child.name == "junk")
+            })
+            .expect("the junk directory");
+        app.toggle_mark(&[index], cx);
+        app.screen = Screen::Running;
+        app.run_epoch += 1;
+        // What a remote removal says when its agent's link drops after
+        // one item: events, last first.
+        app.run =
+            Some(SourceRemoval::Unreachable(std::sync::Mutex::new(vec![
+                RemovalEvent::Lost {
+                    reason: "the agent connection closed".into(),
+                },
+                RemovalEvent::Item {
+                    path: junk.clone(),
+                    bytes: 300_000,
+                    outcome: Ok(()),
+                },
+                RemovalEvent::Start { total: 3 },
+            ])));
+        app.run_epoch
+    });
+    let keep_polling =
+        update(&view, cx, |app, cx| app.poll_removal_once(epoch, cx));
+    assert!(!keep_polling, "the run is over");
+    draw(cx);
+    let (screen, summary, marks, scanning) = read(&view, cx, |app| {
+        (
+            app.screen,
+            app.run_summary.clone(),
+            app.marks.len(),
+            app.scan.is_some(),
+        )
+    });
+    assert_eq!(screen, Screen::Done);
+    assert_eq!(
+        summary.lost.as_deref(),
+        Some("the agent connection closed"),
+        "{summary:?}"
+    );
+    assert_eq!(marks, 1, "the marks stay for the rescan");
+    assert!(!scanning, "no scan into a lost connection");
+}
+
 /// A subdivided directory keeps a band at the top for its own name, and its
 /// children start below it. That is what makes the inner tiles selectable: the
 /// parent's name never covers them.

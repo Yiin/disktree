@@ -444,9 +444,13 @@ fn with_stderr(message: String, stderr: &Mutex<Vec<u8>>) -> String {
     }
 }
 
+/// The kind of failure a request gets when the connection is lost, as
+/// opposed to one the agent answered.
+const LOST: io::ErrorKind = io::ErrorKind::BrokenPipe;
+
 const fn lost(reason: String) -> Reply {
     Reply::Failed {
-        kind: io::ErrorKind::BrokenPipe,
+        kind: LOST,
         message: reason,
     }
 }
@@ -634,34 +638,20 @@ impl RemoteRemoval {
     }
 }
 
-/// The removal worker: the agent's events as they come, and a lost
-/// connection as one failed item and a `Done`, so the review screen
-/// always reaches its end.
+/// The removal worker: the agent's events as they come. A lost connection
+/// ends it with [`RemovalEvent::Lost`], never a `Done`: the agent may
+/// have gone on removing after the last event that arrived, so no count
+/// here is the outcome. A failure the agent itself answered, such as a
+/// root it refused, removed nothing, and ends it as one failed item and a
+/// `Done`.
 fn forward_removal(replies: &Receiver<Reply>, events: &Sender<RemovalEvent>) {
     let (mut removed, mut bytes, mut failed) = (0, 0, 0);
     for reply in replies {
-        match reply {
-            Reply::Removal(event) => {
-                match &event {
-                    RemovalEvent::Item {
-                        bytes: size,
-                        outcome,
-                        ..
-                    } => {
-                        if outcome.is_ok() {
-                            removed += 1;
-                            bytes += size;
-                        } else {
-                            failed += 1;
-                        }
-                    }
-                    RemovalEvent::Start { .. } => {}
-                    RemovalEvent::Done { .. } => {
-                        let _ = events.send(event);
-                        return;
-                    }
-                }
-                let _ = events.send(event);
+        let event = match reply {
+            Reply::Removal(event) => event,
+            Reply::Failed { kind, message } if kind == LOST => {
+                let _ = events.send(RemovalEvent::Lost { reason: message });
+                return;
             }
             other => {
                 let message = match other {
@@ -680,8 +670,32 @@ fn forward_removal(replies: &Receiver<Reply>, events: &Sender<RemovalEvent>) {
                 });
                 return;
             }
+        };
+        if let RemovalEvent::Item {
+            bytes: size,
+            outcome,
+            ..
+        } = &event
+        {
+            if outcome.is_ok() {
+                removed += 1;
+                bytes += size;
+            } else {
+                failed += 1;
+            }
+        }
+        let last = matches!(
+            event,
+            RemovalEvent::Done { .. } | RemovalEvent::Lost { .. }
+        );
+        let _ = events.send(event);
+        if last {
+            return;
         }
     }
+    let _ = events.send(RemovalEvent::Lost {
+        reason: "the agent connection closed".into(),
+    });
 }
 
 fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

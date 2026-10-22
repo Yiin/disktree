@@ -1396,6 +1396,12 @@ pub enum RemovalEvent {
         bytes: u64,
         failed: usize,
     },
+    /// The removal runs on another machine and the link to it was lost
+    /// before its `Done`: what happened after the last item reported is
+    /// unknown, and only a rescan can tell. Never sent by a removal here.
+    Lost {
+        reason: String,
+    },
 }
 
 /// A removal running on its own thread.
@@ -1438,7 +1444,9 @@ impl Tally {
                     self.failed += 1;
                 }
             }
-            RemovalEvent::Done { .. } => self.done = true,
+            RemovalEvent::Done { .. } | RemovalEvent::Lost { .. } => {
+                self.done = true;
+            }
         }
     }
 

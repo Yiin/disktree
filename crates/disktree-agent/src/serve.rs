@@ -61,16 +61,28 @@ fn hostname() -> String {
 
 /// Answer requests from `input` on `output` until `input` ends.
 ///
-/// Work still running then is abandoned with the process, which is what a
-/// closed connection means: nobody is left to read the answer.
+/// Work still running then is cancelled, and abandoned with the process,
+/// which is what a closed connection means: nobody is left to read the
+/// answer, or to cancel it.
 pub fn serve(
-    mut input: impl Read,
+    input: impl Read,
     output: impl Write + Send + 'static,
 ) -> io::Result<()> {
     let agent = Arc::new(Agent {
         output: Mutex::new(Box::new(output)),
         cancels: Mutex::new(HashMap::new()),
+        gone: AtomicBool::new(false),
     });
+    let served = answer_requests(&agent, input);
+    agent.gone.store(true, Ordering::Relaxed);
+    for cancel in lock(&agent.cancels).values() {
+        cancel.store(true, Ordering::Relaxed);
+    }
+    served
+}
+
+/// The hello, then every request from `input` until it ends.
+fn answer_requests(agent: &Arc<Agent>, mut input: impl Read) -> io::Result<()> {
     removal::prime_mount_points();
     {
         let mut output = lock(&agent.output);
@@ -108,7 +120,7 @@ pub fn serve(
         // behind its request is never read before there is a flag to set.
         let cancel = Arc::new(AtomicBool::new(false));
         lock(&agent.cancels).insert(id, Arc::clone(&cancel));
-        let agent = Arc::clone(&agent);
+        let agent = Arc::clone(agent);
         thread::Builder::new()
             .name(format!("disktree-agent-{id}"))
             .spawn(move || {
@@ -125,14 +137,22 @@ struct Agent {
     output: Mutex<Box<dyn Write + Send>>,
     /// Flags that stop the scan or removal with that id.
     cancels: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    /// Whether the client has gone: its input ended, or a reply to it
+    /// could not be written. A removal stops for nobody else.
+    gone: AtomicBool,
 }
 
 impl Agent {
     fn send(&self, id: u64, reply: &Reply) -> io::Result<()> {
         let (tag, payload) = reply.encode(id);
         let mut output = lock(&self.output);
-        write_frame(&mut *output, tag, &payload)?;
-        output.flush()
+        let sent = write_frame(&mut *output, tag, &payload)
+            .and_then(|()| output.flush());
+        drop(output);
+        if sent.is_err() {
+            self.gone.store(true, Ordering::Relaxed);
+        }
+        sent
     }
 
     fn answer(
@@ -262,6 +282,11 @@ impl Agent {
     /// Remove what this machine's own plan allows, and report what it
     /// refused as failures: the client's idea of what is safe here is
     /// never what decides.
+    ///
+    /// The start is said before anything is touched, so a client that
+    /// cannot be written to gets nothing removed. Once one cannot be
+    /// written to, or its input ends, the removal stops before its next
+    /// target: nobody could see it, or cancel it.
     fn remove(
         &self,
         id: u64,
@@ -283,10 +308,22 @@ impl Agent {
                 outcome: Err(format!("refused: {}", blocked.reason)),
             })
             .collect();
+        self.send(
+            id,
+            &Reply::Removal(RemovalEvent::Start {
+                total: plan.targets.len() + refused.len(),
+            }),
+        )?;
+        for item in &refused {
+            self.send(id, &Reply::Removal(item.clone()))?;
+        }
         let run = removal::spawn(plan, mode);
         let mut cancelled = false;
         loop {
-            if !cancelled && cancel.load(Ordering::Relaxed) {
+            if !cancelled
+                && (cancel.load(Ordering::Relaxed)
+                    || self.gone.load(Ordering::Relaxed))
+            {
                 run.cancel();
                 cancelled = true;
             }
@@ -294,35 +331,28 @@ impl Agent {
                 thread::sleep(REMOVAL_EVERY);
                 continue;
             };
-            match event {
-                RemovalEvent::Start { total } => {
-                    self.send(
-                        id,
-                        &Reply::Removal(RemovalEvent::Start {
-                            total: total + refused.len(),
-                        }),
-                    )?;
-                    for item in &refused {
-                        self.send(id, &Reply::Removal(item.clone()))?;
-                    }
-                }
+            let event = match event {
+                // Already said, with the refused ones counted.
+                RemovalEvent::Start { .. } => continue,
                 RemovalEvent::Done {
                     removed,
                     bytes,
                     failed,
-                } => {
-                    return self.send(
-                        id,
-                        &Reply::Removal(RemovalEvent::Done {
-                            removed,
-                            bytes,
-                            failed: failed + refused.len(),
-                        }),
-                    );
-                }
-                item @ RemovalEvent::Item { .. } => {
-                    self.send(id, &Reply::Removal(item))?;
-                }
+                } => RemovalEvent::Done {
+                    removed,
+                    bytes,
+                    failed: failed + refused.len(),
+                },
+                event @ (RemovalEvent::Item { .. }
+                | RemovalEvent::Lost { .. }) => event,
+            };
+            let last = !matches!(event, RemovalEvent::Item { .. });
+            if let Err(error) = self.send(id, &Reply::Removal(event)) {
+                run.cancel();
+                return Err(error);
+            }
+            if last {
+                return Ok(());
             }
         }
     }
@@ -399,6 +429,115 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    /// Output that works until `broken` is set, then fails every write
+    /// the way a closed pipe does.
+    #[derive(Clone, Default)]
+    struct Breakable {
+        written: Captured,
+        broken: Arc<AtomicBool>,
+    }
+
+    impl Write for Breakable {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.broken.load(Ordering::Relaxed) {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            self.written.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `count` directories of `files` small files each, under `root`.
+    fn directories(root: &Path, count: usize, files: usize) -> Vec<Target> {
+        (0..count)
+            .map(|index| {
+                let dir = root.join(format!("d{index}"));
+                std::fs::create_dir(&dir).unwrap();
+                for file in 0..files {
+                    std::fs::write(dir.join(format!("f{file}")), b"x").unwrap();
+                }
+                Target {
+                    path: dir,
+                    bytes: 1,
+                    is_dir: true,
+                    hidden: false,
+                }
+            })
+            .collect()
+    }
+
+    fn remaining(targets: &[Target]) -> usize {
+        targets.iter().filter(|target| target.path.exists()).count()
+    }
+
+    fn remove_frame(root: &Path, targets: &[Target]) -> Vec<u8> {
+        let (tag, payload) = Request::Remove {
+            root: root.to_path_buf(),
+            targets: targets.to_vec(),
+            mode: RemovalMode::Permanent,
+        }
+        .encode(1);
+        let mut frame = Vec::new();
+        write_frame(&mut frame, tag, &payload).unwrap();
+        frame
+    }
+
+    /// A client that can no longer be written to gets nothing removed:
+    /// the start is said before the first target is touched.
+    #[test]
+    fn a_removal_never_starts_for_a_client_it_cannot_write_to() {
+        let temp = tempfile::tempdir().unwrap();
+        let targets = directories(temp.path(), 20, 1);
+        let (reader, mut writer) = io::pipe().unwrap();
+        let output = Breakable::default();
+        let serving = thread::spawn({
+            let output = output.clone();
+            move || serve(reader, output)
+        });
+        while lock(&output.written.0).is_empty() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        output.broken.store(true, Ordering::Relaxed);
+        writer
+            .write_all(&remove_frame(temp.path(), &targets))
+            .unwrap();
+        // The answer fails to send; give the request time to reach it.
+        thread::sleep(Duration::from_millis(300));
+        drop(writer);
+        serving.join().unwrap().unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(remaining(&targets), targets.len(), "nothing removed");
+    }
+
+    /// When the client's input ends mid-removal, the removal stops before
+    /// its next target instead of running to the end for nobody.
+    #[test]
+    fn a_removal_stops_when_its_client_goes() {
+        let temp = tempfile::tempdir().unwrap();
+        let targets = directories(temp.path(), 200, 200);
+        let (reader, mut writer) = io::pipe().unwrap();
+        let serving = thread::spawn(move || serve(reader, Captured::default()));
+        writer
+            .write_all(&remove_frame(temp.path(), &targets))
+            .unwrap();
+        let started = std::time::Instant::now();
+        while remaining(&targets) == targets.len() {
+            assert!(started.elapsed() < Duration::from_secs(30), "no start");
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(writer);
+        serving.join().unwrap().unwrap();
+        // Long enough for every target to go, had it gone on.
+        thread::sleep(Duration::from_millis(1500));
+        let left = remaining(&targets);
+        assert!(left >= targets.len() / 2, "only {left} of 200 were left");
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(remaining(&targets), left, "it stopped");
     }
 
     #[test]

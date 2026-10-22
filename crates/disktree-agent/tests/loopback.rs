@@ -286,6 +286,7 @@ fn a_forged_plan_removes_only_what_the_agent_allows() {
                 items.push((path, outcome));
             }
             done @ RemovalEvent::Done { .. } => break done,
+            lost @ RemovalEvent::Lost { .. } => panic!("{lost:?}"),
         }
     };
     assert!(matches!(
@@ -346,7 +347,8 @@ fn a_forged_plan_removes_only_what_the_agent_allows() {
                         break;
                     }
                     RemovalEvent::Item { outcome, .. } => said.push(outcome),
-                    other @ RemovalEvent::Start { .. } => panic!("{other:?}"),
+                    other @ (RemovalEvent::Start { .. }
+                    | RemovalEvent::Lost { .. }) => panic!("{other:?}"),
                 }
             }
             assert!(
@@ -402,6 +404,66 @@ fn an_agent_that_is_missing_reports_what_the_shell_said() {
     let message = error.to_string();
     assert!(message.contains("exited before introducing"), "{message}");
     assert!(message.contains("disktree-agent: not found"), "{message}");
+}
+
+/// An agent whose link drops mid-removal: the removal ends as lost, with
+/// no `Done` and so no counts, since the agent may have gone on.
+#[cfg(unix)]
+#[test]
+fn a_removal_whose_link_drops_ends_lost_not_done() {
+    use disktree_agent::protocol::{Reply, tag};
+    use disktree_agent::wire::write_frame;
+
+    let temp = TempDir::new().unwrap();
+    let mut introduction = disktree_agent::protocol::preamble();
+    write_frame(
+        &mut introduction,
+        tag::HELLO,
+        &disktree_agent::serve::hello().encode(),
+    )
+    .unwrap();
+    let mut events = Vec::new();
+    for event in [
+        RemovalEvent::Start { total: 3 },
+        RemovalEvent::Item {
+            path: temp.path().join("first"),
+            bytes: 10,
+            outcome: Ok(()),
+        },
+    ] {
+        let (tag, payload) = Reply::Removal(event).encode(1);
+        write_frame(&mut events, tag, &payload).unwrap();
+    }
+    fs::write(temp.path().join("introduction"), introduction).unwrap();
+    fs::write(temp.path().join("events"), events).unwrap();
+    // Introduce, wait for the request, say two events, and drop.
+    let client = fake_agent(&format!(
+        "cd '{}' && cat introduction && dd bs=1 count=1 2>/dev/null \
+         >/dev/null && cat events && echo 'link dropped' >&2",
+        temp.path().display()
+    ))
+    .unwrap();
+    let plan = Plan::from_parts(
+        vec![target(&temp.path().join("first"), 10)],
+        Vec::new(),
+        Vec::new(),
+        temp.path().to_path_buf(),
+        0,
+        0,
+    );
+    let run = client.remove(&plan, RemovalMode::Permanent);
+    let mut seen = Vec::new();
+    while let Some(event) = run.next() {
+        seen.push(event);
+    }
+    assert!(
+        matches!(seen.as_slice(), [
+            RemovalEvent::Start { total: 3 },
+            RemovalEvent::Item { .. },
+            RemovalEvent::Lost { reason },
+        ] if reason.contains("link dropped")),
+        "{seen:?}"
+    );
 }
 
 /// An agent that introduces itself and then exits.

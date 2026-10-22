@@ -332,9 +332,10 @@ impl Reply {
     pub const fn is_last(&self) -> bool {
         match self {
             Self::Progress(_) | Self::TreeChunk(_) => false,
-            Self::Removal(event) => {
-                matches!(event, RemovalEvent::Done { .. })
-            }
+            Self::Removal(event) => matches!(
+                event,
+                RemovalEvent::Done { .. } | RemovalEvent::Lost { .. }
+            ),
             Self::TreeEnd { .. }
             | Self::Failed { .. }
             | Self::Space(_)
@@ -656,6 +657,11 @@ fn put_event(out: &mut Encoder, event: &RemovalEvent) {
             out.uint(*bytes);
             out.usize(*failed);
         }
+        // An agent never sends this, but a client reads it the same way.
+        RemovalEvent::Lost { reason } => {
+            out.u8(3);
+            out.str(reason);
+        }
     }
 }
 
@@ -673,6 +679,9 @@ fn take_event(input: &mut Decoder<'_>) -> io::Result<RemovalEvent> {
             removed: input.uint()?,
             bytes: input.uint()?,
             failed: input.usize()?,
+        },
+        3 => RemovalEvent::Lost {
+            reason: input.string()?,
         },
         other => return Err(invalid(format!("removal event {other}"))),
     })

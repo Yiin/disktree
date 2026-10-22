@@ -3119,6 +3119,9 @@ fn running(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
 fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
     let theme = cx.omarchy().clone();
     let summary = app.run_summary.clone();
+    if let Some(reason) = &summary.lost {
+        return outcome_unknown(app, reason, cx);
+    }
     let measured = match (app.space_baseline, app.space) {
         (Some(before), Some(after)) => Some(
             after
@@ -3236,6 +3239,99 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
                 .border_color(theme.divider())
                 .child(
                     // An acknowledgement: the result is already on screen.
+                    button("continue", "Done", ButtonVariant::Primary, cx)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.screen = Screen::Explore;
+                            cx.notify();
+                            window.focus(&this.focus, cx);
+                        })),
+                )
+                .child(widgets::hint("enter", "continue", cx)),
+        )
+}
+
+/// The end of a removal whose link was lost before it said it was done.
+/// No counts: the machine may have gone on removing after the last item
+/// that arrived, so only a rescan can say what is left.
+fn outcome_unknown(
+    app: &Disktree,
+    reason: &str,
+    cx: &gpui_kit::Context<'_, Disktree>,
+) -> Div {
+    let theme = cx.omarchy().clone();
+    let host = app.source.name().to_owned();
+    let mut log = div().flex().flex_col().gap(space::XXS);
+    for (path, outcome) in app.run_log.iter().rev().take(40) {
+        log = log.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(space::SM)
+                .text_size(text::CAPTION)
+                .child(
+                    div().text_color(theme.foreground).child(short_name(path)),
+                )
+                .child(div().text_color(theme.secondary).child(
+                    match outcome {
+                        Ok(()) => "removed".to_owned(),
+                        Err(error) => error.clone(),
+                    },
+                )),
+        );
+    }
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(space::MD)
+        .p(space::LG)
+        .flex_1()
+        .min_h_0()
+        .child(
+            div()
+                .text_color(theme.warning)
+                .child(format!("Outcome unknown, rescan: {reason}.")),
+        )
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(format!(
+                    "The link to {host} was lost during the removal, and \
+                     {host} may have gone on after the last item below. \
+                     Press r to reconnect and scan again: the marks stay, \
+                     and what is gone drops off them."
+                )),
+        )
+        .child(separator(cx))
+        .child(widgets::section(
+            "what arrived before the link was lost",
+            cx,
+        ))
+        .child(log);
+
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .child(screen_header(
+            "Outcome unknown",
+            "the link was lost mid-removal",
+            &theme,
+            cx,
+        ))
+        .child(body)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::LG)
+                .px(space::LG)
+                .py(space::SM)
+                .border_t_1()
+                .border_color(theme.divider())
+                .child(
                     button("continue", "Done", ButtonVariant::Primary, cx)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.screen = Screen::Explore;

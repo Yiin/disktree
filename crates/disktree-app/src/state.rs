@@ -317,6 +317,10 @@ pub struct RunSummary {
     pub removed: u64,
     pub bytes: u64,
     pub failed: usize,
+    /// Why the outcome is unknown: the link to the machine removing was
+    /// lost before it said it was done. The counts are then only what
+    /// arrived, not what happened.
+    pub lost: Option<String>,
 }
 
 /// Everything the app knows and everything it can do.
@@ -2444,15 +2448,24 @@ impl Disktree {
                     self.run_summary.failed = failed;
                     finished = true;
                 }
+                RemovalEvent::Lost { reason } => {
+                    self.run_summary.lost = Some(reason);
+                    finished = true;
+                }
             }
         }
         if finished {
             self.run = None;
-            self.marks.clear();
             self.screen = Screen::Done;
-            // The tree on screen is now wrong; start over rather than leaving
-            // numbers that include what was just removed.
-            self.start_scan(cx);
+            // The marks stay when the outcome is unknown: the rescan after
+            // reconnecting drops what is gone. A scan now would only meet
+            // the lost connection.
+            if self.run_summary.lost.is_none() {
+                self.marks.clear();
+                // The tree on screen is now wrong; start over rather than
+                // leaving numbers that include what was just removed.
+                self.start_scan(cx);
+            }
         }
         cx.notify();
         !finished
