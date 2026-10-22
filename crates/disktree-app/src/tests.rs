@@ -2127,6 +2127,10 @@ fn a_lost_agent_is_said_and_r_reconnects(cx: &mut TestAppContext) {
     );
 }
 
+fn nodes(node: &disktree_core::tree::Node) -> u64 {
+    1 + node.children.iter().map(nodes).sum::<u64>()
+}
+
 /// The real thing, headless: `DISKTREE_LIVE_HOST=spark-2` (and
 /// `DISKTREE_LIVE_SUDO=1` for `--sudo`) connects over ssh, installs the
 /// agent this build carries, scans the default root through the window's
@@ -2158,9 +2162,6 @@ fn live_remote_scan(cx: &mut TestAppContext) {
     let scanned = started.elapsed();
     draw(cx);
 
-    fn nodes(node: &disktree_core::tree::Node) -> u64 {
-        1 + node.children.iter().map(nodes).sum::<u64>()
-    }
     let (root, title, tree, space, home, trash) = read(&view, cx, |app| {
         let tree = app.tree().expect("tree");
         (
@@ -2195,7 +2196,7 @@ fn live_remote_scan(cx: &mut TestAppContext) {
         );
     }
     println!("connected in   {connected:.2?}");
-    println!("scanned in     {:.2?} (from start)", scanned);
+    println!("scanned in     {scanned:.2?} (from start)");
 
     let root_path = read(&view, cx, |app| app.root_path.clone());
     let plan = read(&view, cx, |app| {
