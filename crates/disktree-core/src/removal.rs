@@ -890,6 +890,10 @@ fn pinned_files(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RunDisk {
     point: PathBuf,
+    /// The filesystem mounted at [`crate::space::SPARKOS_DISK`], at this
+    /// point or another: by device, not by spelling, so a second mount of
+    /// that disk under `/run` keeps its boot images refused.
+    sparkos: bool,
     /// Each other mount of the same filesystem, `/run` included: the
     /// folder of the filesystem it shows, and where.
     binds: Vec<(PathBuf, PathBuf)>,
@@ -899,6 +903,10 @@ struct RunDisk {
 /// mounted whole under `/run` but outside `/run/media`, seen once at that
 /// point. Missing information leaves a disk out, and the `/run` guard on.
 fn run_disks(mounts: &[crate::space::MountView]) -> Vec<RunDisk> {
+    let sparkos = mounts
+        .iter()
+        .find(|mount| mount.point == Path::new(crate::space::SPARKOS_DISK))
+        .map(|mount| mount.device.as_str());
     mounts
         .iter()
         .filter(|mount| {
@@ -919,6 +927,7 @@ fn run_disks(mounts: &[crate::space::MountView]) -> Vec<RunDisk> {
         })
         .map(|disk| RunDisk {
             point: guard_key(&disk.point),
+            sparkos: sparkos == Some(disk.device.as_str()),
             // A bind under `/run` counts too: the folder it shows must not
             // be emptied, and what is seen through it is judged as `/run`.
             binds: mounts
@@ -957,9 +966,7 @@ fn on_run_disk(
     }
     // The running image is pinned on its own; the others there are the
     // boot menu's fallbacks, and choosing between them is a shell job.
-    if disk.point == Path::new(crate::space::SPARKOS_DISK)
-        && inside.starts_with("/images")
-    {
+    if disk.sparkos && inside.starts_with("/images") {
         return Some(Err("SparkOS boots from the images here, and keeps the \
                          others as fallbacks: remove one from a shell"
             .into()));
@@ -2390,6 +2397,24 @@ mod tests {
         ] {
             assert_eq!(judge(path), None, "{path}");
         }
+        // A second whole mount of the same disk under /run: its images
+        // are the same files, and refused the same.
+        let twice = crate::space::parse_mountinfo(
+            "33 39 0:29 / /run rw - tmpfs tmpfs rw\n\
+             34 33 259:2 / /run/sparkos/host rw - ext4 /dev/nvme0n1p2 rw\n\
+             35 33 259:2 / /run/again rw - ext4 /dev/nvme0n1p2 rw\n\
+             36 33 259:5 / /run/other rw - ext4 /dev/sdb1 rw\n",
+        );
+        let disks = run_disks(&twice);
+        let points: Vec<_> =
+            twice.iter().map(|view| guard_key(&view.point)).collect();
+        let judge =
+            |path: &str| on_run_disk(Path::new(path), &points, &disks, &homes);
+        for path in ["/run/again/images", "/run/again/images/old.erofs"] {
+            let reason = judge(path).and_then(Result::err).expect(path);
+            assert!(reason.contains("SparkOS boots"), "{path}: {reason}");
+        }
+        assert_eq!(judge("/run/other/images/old.erofs"), Some(Ok(())));
         assert!(
             run_disks(&crate::space::parse_mountinfo(
                 "33 39 0:29 / /run rw - tmpfs tmpfs rw\n\
