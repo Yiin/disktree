@@ -66,6 +66,26 @@ fn view_over<'a>(
     (view, cx)
 }
 
+/// Initialize gpui-omarchy, then stop it following the theme files.
+///
+/// Following them starts notify-rs's inotify thread, whose callback wakes a
+/// gpui task. The test scheduler refuses work from any thread but its own,
+/// so a long test that sees a theme write after its asserts pass panics in
+/// `end_test`. An explicit theme drops the watcher, which no test needs.
+fn init_omarchy(cx: &TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| Theme::tokyo_night().apply(cx));
+}
+
+/// How a live test reaches its host: ssh, or a local agent through pipes
+/// when `DISKTREE_LIVE_AGENT` names one, so the same paths run here.
+fn live_reach(sudo: bool) -> crate::remote::Reach {
+    std::env::var_os("DISKTREE_LIVE_AGENT").map_or_else(
+        || crate::remote::Reach::Ssh { sudo },
+        |agent| crate::remote::Reach::Direct(PathBuf::from(agent)),
+    )
+}
+
 fn draw(cx: &mut Window) {
     cx.update(|window, cx| {
         window.draw(cx).clear(cx);
@@ -95,7 +115,7 @@ fn read<R>(
 
 #[gpui_kit::test]
 fn the_window_draws_a_treemap_with_tiles(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -119,7 +139,7 @@ fn the_window_draws_a_treemap_with_tiles(cx: &mut TestAppContext) {
 fn the_first_scan_shows_what_it_is_doing_then_the_treemap(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let root = temp.path().to_path_buf();
     // Through the real constructor, so this is the path every first run takes.
@@ -156,7 +176,7 @@ fn the_first_scan_shows_what_it_is_doing_then_the_treemap(
 fn an_explicit_local_source_scans_the_tree_through_its_door(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let root = temp.path().to_path_buf();
     // Named, not implied: the constructor a disk on another machine will use.
@@ -187,7 +207,7 @@ fn an_explicit_local_source_scans_the_tree_through_its_door(
 
 #[gpui_kit::test]
 fn keys_walk_the_tree_and_mark_what_is_selected(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -227,7 +247,7 @@ fn keys_walk_the_tree_and_mark_what_is_selected(cx: &mut TestAppContext) {
 fn a_permanent_deletion_asks_in_an_alert_dialog_then_removes(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -306,7 +326,7 @@ fn a_permanent_deletion_asks_in_an_alert_dialog_then_removes(
 /// without a word.
 #[gpui_kit::test]
 fn delete_with_every_mark_kept_back_says_why(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let outside = tempfile::TempDir::new().expect("outside");
     let (view, cx) = view_over(temp.path(), cx);
@@ -347,7 +367,7 @@ fn a_removal_whose_link_is_lost_says_the_outcome_is_unknown(
     use crate::source::SourceRemoval;
     use disktree_core::removal::RemovalEvent;
 
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -418,7 +438,7 @@ fn a_removal_whose_link_is_lost_says_the_outcome_is_unknown(
 fn a_parents_name_gets_its_own_band_above_its_children(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -468,7 +488,7 @@ fn a_parents_name_gets_its_own_band_above_its_children(
 
 #[gpui_kit::test]
 fn hovering_reports_the_tile_under_the_pointer(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -516,7 +536,7 @@ fn hovering_reports_the_tile_under_the_pointer(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn right_click_selects_the_tile_and_reveals_it(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -580,7 +600,7 @@ fn right_click_selects_the_tile_and_reveals_it(cx: &mut TestAppContext) {
 fn typing_filters_live_and_enter_shows_only_the_matches(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -649,7 +669,7 @@ fn typing_filters_live_and_enter_shows_only_the_matches(
 
 #[gpui_kit::test]
 fn the_help_overlay_opens_and_closes(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -662,7 +682,7 @@ fn the_help_overlay_opens_and_closes(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn the_volume_picker_opens_moves_and_closes(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -686,7 +706,7 @@ fn the_volume_picker_opens_moves_and_closes(cx: &mut TestAppContext) {
 fn enter_in_the_focused_volume_picker_scans_the_selected_root(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let target = temp.path().join("junk");
     let (view, cx) = view_over(temp.path(), cx);
@@ -714,7 +734,7 @@ fn enter_in_the_focused_volume_picker_scans_the_selected_root(
 fn the_volume_picker_is_centred_and_still_dismisses_from_outside(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     // Fixed rows, so this is about where the popup lands and not about which
@@ -768,7 +788,7 @@ fn the_volume_picker_is_centred_and_still_dismisses_from_outside(
 
 #[gpui_kit::test]
 fn showing_a_tile_that_is_gone_says_so_instead(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -783,7 +803,7 @@ fn showing_a_tile_that_is_gone_says_so_instead(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn command_chords_are_not_read_as_plain_letters(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -800,7 +820,7 @@ fn command_chords_are_not_read_as_plain_letters(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn the_treemap_zooms_with_the_wheel_and_resets(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -823,7 +843,7 @@ fn the_treemap_zooms_with_the_wheel_and_resets(cx: &mut TestAppContext) {
 /// theme, so a light theme is a real second configuration.
 #[gpui_kit::test]
 fn both_appearances_draw(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     for theme in [Theme::tokyo_night(), Theme::flexoki_light()] {
@@ -840,7 +860,7 @@ fn both_appearances_draw(cx: &mut TestAppContext) {
 /// walk is in flight.
 #[gpui_kit::test]
 fn a_view_without_flags_or_marks_still_draws(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| {
@@ -868,7 +888,7 @@ fn a_view_without_flags_or_marks_still_draws(cx: &mut TestAppContext) {
 /// button both have to reach the same state.
 #[gpui_kit::test]
 fn the_review_screen_switches_removal_mode(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| {
@@ -900,7 +920,7 @@ fn the_review_screen_switches_removal_mode(cx: &mut TestAppContext) {
 fn the_review_screen_copies_the_list_as_an_agent_prompt(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let junk = temp.path().join("junk");
     let (view, cx) = view_over(temp.path(), cx);
@@ -938,7 +958,7 @@ fn the_review_screen_copies_the_list_as_an_agent_prompt(
 /// stays, and nothing on disk changes.
 #[gpui_kit::test]
 fn escape_in_the_delete_dialog_cancels(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| {
@@ -971,7 +991,7 @@ fn escape_in_the_delete_dialog_cancels(cx: &mut TestAppContext) {
 /// commits without a dialog; the permanent one is a deliberate choice.
 #[gpui_kit::test]
 fn the_trash_is_the_default_when_there_is_one(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     let (mode, available) = read(&view, cx, |app| {
@@ -988,7 +1008,7 @@ fn the_trash_is_the_default_when_there_is_one(cx: &mut TestAppContext) {
 /// in the app is expressed in, and the mosaic's header band follows it.
 #[gpui_kit::test]
 fn interface_zoom_scales_the_rem_and_the_header_band(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -1037,7 +1057,7 @@ fn child_crumbs(app: &Disktree, parent: &[usize], name: &str) -> Vec<usize> {
 /// after the descent was never the area that was zoomed into.
 #[gpui_kit::test]
 fn the_wheel_goes_into_the_directory_it_zoomed_into(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -1078,7 +1098,7 @@ fn the_wheel_goes_into_the_directory_it_zoomed_into(cx: &mut TestAppContext) {
 /// directory, and on a file enters the directory holding it.
 #[gpui_kit::test]
 fn enter_opens_the_selected_directory_at_any_depth(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -1116,7 +1136,7 @@ fn enter_opens_the_selected_directory_at_any_depth(cx: &mut TestAppContext) {
 fn the_mark_key_follows_the_pointer_until_the_keyboard_moves(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -1170,7 +1190,7 @@ fn the_mark_key_follows_the_pointer_until_the_keyboard_moves(
 fn after_descending_every_tile_is_inside_the_directory_drawn(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -1268,7 +1288,7 @@ fn dragging_the_panel_edge_resizes_it_within_its_limits(
     use crate::state::{PANEL_MAX_REMS, PANEL_MIN_REMS, panel_width};
     use gpui_kit::{Modifiers, MouseButton};
 
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
@@ -1318,7 +1338,7 @@ fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
 ) {
     use crate::state::Crumb;
 
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let inner = temp.path().join("junk");
     let (view, cx) = view_over(&inner, cx);
@@ -1376,7 +1396,7 @@ fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
 fn enter_before_the_search_lands_applies_it_when_it_does(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -1402,7 +1422,7 @@ fn enter_before_the_search_lands_applies_it_when_it_does(
 fn a_crumb_lists_its_siblings_and_jumps_sideways(cx: &mut TestAppContext) {
     use gpui_kit::{Modifiers, MouseButton};
 
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
@@ -1496,7 +1516,7 @@ fn names_at(names: &[String], index: usize) -> String {
 
 #[gpui_kit::test]
 fn marking_a_directory_marks_everything_inside_it(cx: &mut TestAppContext) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
@@ -1564,7 +1584,7 @@ fn marking_a_directory_marks_everything_inside_it(cx: &mut TestAppContext) {
 fn back_and_forward_retrace_where_you_have_been(cx: &mut TestAppContext) {
     use gpui_kit::Modifiers;
 
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
@@ -1649,7 +1669,7 @@ fn back_and_forward_retrace_where_you_have_been(cx: &mut TestAppContext) {
 fn switching_the_metric_keeps_the_directory_and_the_selection(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = tempfile::TempDir::new().expect("tempdir");
     let root = temp.path();
     // Largest by size, but fewest files: the two swap places.
@@ -1698,7 +1718,7 @@ fn switching_the_metric_keeps_the_directory_and_the_selection(
 fn escape_cancels_the_first_scan_and_r_starts_it_again(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let root = temp.path().to_path_buf();
     let (view, cx) =
@@ -1730,7 +1750,7 @@ fn escape_cancels_the_first_scan_and_r_starts_it_again(
 fn escape_cancels_widening_and_keeps_the_tree_on_screen(
     cx: &mut TestAppContext,
 ) {
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let inner = temp.path().join("junk");
     let (view, cx) = view_over(&inner, cx);
@@ -1762,7 +1782,7 @@ fn escape_cancels_widening_and_keeps_the_tree_on_screen(
 fn mouse_side_buttons_go_back_and_forward(cx: &mut TestAppContext) {
     use gpui_kit::{Modifiers, MouseButton, NavigationDirection};
 
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
@@ -1871,7 +1891,7 @@ fn power_efficiency_menu_saves_without_discarding_the_tree(
     use crate::power::{self, PowerEfficiency as Power};
     use gpui_kit::Modifiers;
 
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let config = tempfile::tempdir().expect("config");
     let path = config.path().join("power-efficiency");
@@ -1923,7 +1943,7 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     use crate::power::PowerEfficiency as Power;
     use gpui_kit::Modifiers;
 
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let config = tempfile::tempdir().expect("config");
     let (view, cx) = view_over(temp.path(), cx);
@@ -2068,7 +2088,7 @@ fn a_remote_source_scans_marks_and_removes_through_its_agent(
 ) {
     use crate::remote::{Ask, Reach, Remote};
 
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let root = std::fs::canonicalize(temp.path()).expect("root");
     let swapped = root.join("swap/deeper/more.bin");
@@ -2209,7 +2229,7 @@ fn a_lost_agent_is_said_and_r_reconnects(cx: &mut TestAppContext) {
 
     use crate::remote::{Ask, Reach, Remote};
 
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let mut introduction = disktree_agent::protocol::preamble();
     disktree_agent::wire::write_frame(
@@ -2285,7 +2305,7 @@ fn a_lost_link_keeps_every_mark_back_and_delete_says_why(
 
     use crate::remote::{Ask, Reach, Remote};
 
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let temp = fixture();
     let root = std::fs::canonicalize(temp.path()).expect("root");
     // The real agent, behind a script that says its process id, so the
@@ -2372,18 +2392,20 @@ fn nodes(node: &disktree_core::tree::Node) -> u64 {
 /// The real thing, headless: `DISKTREE_LIVE_HOST=spark-2` (and
 /// `DISKTREE_LIVE_SUDO=1` for `--sudo`) connects over ssh, installs the
 /// agent this build carries, scans the default root through the window's
-/// own code path, and prints what it found. Removes nothing; it only asks
-/// the agent to plan two paths. Needs `make agent` before the build.
+/// own code path, and prints what it found. `DISKTREE_LIVE_AGENT` naming a
+/// local agent reaches it through pipes instead of ssh. Removes nothing; it
+/// only asks the agent to plan two paths. Needs `make agent` before the
+/// build.
 #[gpui_kit::test]
 #[ignore = "needs a reachable host: DISKTREE_LIVE_HOST"]
 fn live_remote_scan(cx: &mut TestAppContext) {
-    use crate::remote::{Ask, Reach, Remote};
+    use crate::remote::{Ask, Remote};
 
     let host = std::env::var("DISKTREE_LIVE_HOST").expect("DISKTREE_LIVE_HOST");
     let sudo = std::env::var_os("DISKTREE_LIVE_SUDO").is_some();
-    cx.update(gpui_omarchy::init);
+    init_omarchy(cx);
     let started = std::time::Instant::now();
-    let remote = Remote::new(host, Reach::Ssh { sudo }, Ask::Default);
+    let remote = Remote::new(host, live_reach(sudo), Ask::Default);
     let source = Source::Remote(std::sync::Arc::new(remote));
     let (view, cx) = cx.add_window_view(move |_, cx| {
         Disktree::with_source(source, PathBuf::new(), live_options(), 3, cx)
@@ -2486,12 +2508,14 @@ fn live_options() -> ScanOptions {
 /// `DISKTREE_LIVE_ROOT`, the folder to scan there, and
 /// `DISKTREE_LIVE_MARK`, the one name in it to mark, removed through the
 /// review screen in `DISKTREE_LIVE_MODE` (`trash` or `permanent`), with
-/// `DISKTREE_LIVE_SUDO=1` for `--sudo`. Removes that one path and nothing
-/// else; point it at a scratch folder.
+/// `DISKTREE_LIVE_SUDO=1` for `--sudo`. `DISKTREE_LIVE_AGENT` naming a local
+/// agent reaches it through pipes instead of ssh, which is how a long run is
+/// proved on this machine. Removes that one path and nothing else; point it
+/// at a scratch folder.
 #[gpui_kit::test]
 #[ignore = "removes a file on a reachable host: DISKTREE_LIVE_HOST"]
 fn live_remote_removal(cx: &mut TestAppContext) {
-    use crate::remote::{Ask, Reach, Remote};
+    use crate::remote::{Ask, Remote};
 
     let var = |name: &str| std::env::var(name).expect(name);
     let host = var("DISKTREE_LIVE_HOST");
@@ -2503,8 +2527,8 @@ fn live_remote_removal(cx: &mut TestAppContext) {
         other => panic!("DISKTREE_LIVE_MODE is trash or permanent: {other}"),
     };
     let sudo = std::env::var_os("DISKTREE_LIVE_SUDO").is_some();
-    cx.update(gpui_omarchy::init);
-    let remote = Remote::new(host, Reach::Ssh { sudo }, Ask::Path(root));
+    init_omarchy(cx);
+    let remote = Remote::new(host, live_reach(sudo), Ask::Path(root));
     let source = Source::Remote(std::sync::Arc::new(remote));
     let (view, cx) = cx.add_window_view(move |_, cx| {
         Disktree::with_source(source, PathBuf::new(), live_options(), 3, cx)
