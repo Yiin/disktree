@@ -18,5 +18,5 @@ pub mod tree_codec;
 pub mod wire;
 
 pub use client::{Client, RemoteRemoval, RemoteScan, Transfer};
-pub use protocol::{Hello, PROTOCOL, SpaceReport};
+pub use protocol::{Hello, PROTOCOL, PathInfo, SpaceReport};
 pub use serve::serve;

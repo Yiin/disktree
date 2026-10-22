@@ -3,7 +3,8 @@
 //! Before deleting an agent worktree the question is "would anything be
 //! lost": uncommitted changes, stashes, commits nobody pushed. That is three
 //! cheap git calls, run off the UI thread when a checkout is selected and
-//! remembered per path.
+//! remembered per path. Here rather than in the app so the agent asks the
+//! git of the machine the checkout is on.
 
 use std::path::Path;
 use std::process::{Command, Stdio};

@@ -1435,11 +1435,13 @@ name = "disktree-app"
 version = "0.11.0"
 dependencies = [
  "anyhow",
+ "disktree-agent",
  "disktree-core",
  "dunce",
  "gpui-kit",
  "gpui-omarchy",
  "rustc-hash 2.1.3",
+ "sha2 0.10.9",
  "tempfile",
  "windows-sys 0.61.2",
 ]

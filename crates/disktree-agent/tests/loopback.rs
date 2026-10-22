@@ -162,6 +162,40 @@ fn space_and_volumes_are_read_on_the_agent() {
     assert_eq!(points(&volumes), points(&disktree_core::space::volumes()));
 }
 
+#[test]
+fn git_state_and_path_info_are_read_on_the_agent() {
+    let temp = TempDir::new().unwrap();
+    let client = agent();
+    let root = temp.path();
+    write(&root.join("dir/file"), 10);
+    assert_eq!(client.git_state(&root.join("dir")).unwrap(), None);
+    let initialised = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["init", "-q"])
+        .status()
+        .is_ok_and(|status| status.success());
+    if initialised {
+        let state = client.git_state(root).unwrap().expect("a checkout");
+        assert_eq!(state, disktree_core::git::state(root).unwrap());
+        assert_eq!(state.changed, Some(1), "dir/ is untracked");
+    }
+
+    let info = client.path_info(&root.join("dir/../dir")).unwrap();
+    assert_eq!(
+        info.canonical,
+        Some(fs::canonicalize(root.join("dir")).unwrap())
+    );
+    assert_eq!(info.is_dir, Ok(true));
+    assert!(info.exists);
+    let file = client.path_info(&root.join("dir/file")).unwrap();
+    assert_eq!(file.is_dir, Ok(false));
+    let missing = client.path_info(&root.join("gone")).unwrap();
+    assert!(!missing.exists);
+    assert_eq!(missing.canonical, None);
+    assert!(missing.is_dir.is_err());
+}
+
 fn target(path: &Path, bytes: u64) -> Target {
     Target {
         path: path.to_path_buf(),

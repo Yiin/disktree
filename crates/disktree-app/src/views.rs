@@ -415,7 +415,7 @@ fn selection_checkout(app: &Disktree) -> Option<std::path::PathBuf> {
         return None;
     }
     let path = app.path_at(&target)?;
-    crate::git::is_checkout(&path).then_some(path)
+    app.source.is_checkout(&path, node).then_some(path)
 }
 
 /// Width, in rem, below which the side panel gives the mosaic its room.
@@ -1444,7 +1444,7 @@ fn selection_section(
 
     let fourth = if node.is_dir()
         && let Some(path) = &path
-        && crate::git::is_checkout(path)
+        && app.source.is_checkout(path, node)
     {
         let value = match app.git.get(path) {
             Some(Some(state)) => state.summary(),
@@ -2312,7 +2312,19 @@ fn scanning_panel(
                 .text_size(text::TITLE)
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.bright)
-                .child(if cancelled {
+                .child(if app.connecting.is_some() {
+                    app.source.stage().unwrap_or_else(|| {
+                        format!("Connecting to {}", app.source.name())
+                    })
+                } else if app.root_path.as_os_str().is_empty() {
+                    // Another machine that never answered: there is no
+                    // root to name yet.
+                    if cancelled {
+                        format!("Stopped connecting to {}", app.source.name())
+                    } else {
+                        format!("Could not reach {}", app.source.name())
+                    }
+                } else if cancelled {
                     format!("Stopped reading {}", widgets::display_root(app))
                 } else {
                     format!("Reading {}", widgets::display_root(app))
@@ -2365,7 +2377,7 @@ fn scanning_panel(
                 }),
         )
         // A failed scan has nothing left to cancel either.
-        .child(if app.scan.is_none() {
+        .child(if app.scan.is_none() && app.connecting.is_none() {
             button("scan-again", "Scan again", ButtonVariant::Outline, cx)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.start_scan(cx);

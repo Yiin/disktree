@@ -1878,3 +1878,178 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     draw(cx);
     assert!(read(&view, cx, |app| app.power_menu.is_none()));
 }
+
+/// The agent binary `cargo test --workspace` builds beside this test, as
+/// the stand-in for one installed on a host. Not built from here: cargo
+/// holds the build directory while tests run.
+#[cfg(unix)]
+fn local_agent() -> PathBuf {
+    let exe = std::env::current_exe().expect("the test binary");
+    // target/<profile>/deps/<test> → target/<profile>/disktree-agent
+    let agent = exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("the target directory")
+        .join("disktree-agent");
+    assert!(
+        agent.is_file(),
+        "{} is missing: build it with `cargo build -p disktree-agent`, or \
+         run every test with `cargo xtask test`",
+        agent.display()
+    );
+    agent
+}
+
+/// Wait for a remote source to connect, through the poll the UI's own
+/// ticker drives.
+fn finish_connect(view: &Entity<Disktree>, cx: &mut Window) {
+    let epoch = read(view, cx, |app| app.scan_epoch);
+    for _ in 0..12_000 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        if !update(view, cx, |app, cx| app.poll_connect_once(epoch, cx)) {
+            let error = read(view, cx, |app| app.scan_error.clone());
+            assert_eq!(error, None, "connecting failed");
+            return;
+        }
+    }
+    panic!("connecting never finished");
+}
+
+/// Another machine, played by the agent binary on this one: the window
+/// connects, scans through the agent, marks, reviews and removes, and the
+/// agent's own guards refuse what its plan would not allow.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_remote_source_scans_marks_and_removes_through_its_agent(
+    cx: &mut TestAppContext,
+) {
+    use crate::remote::{Ask, Reach, Remote};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let root = std::fs::canonicalize(temp.path()).expect("root");
+    let swapped = root.join("swap/deeper/more.bin");
+    std::fs::create_dir_all(swapped.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&swapped, vec![b'x'; 5_000]).expect("write");
+    let outside = tempfile::TempDir::new().expect("outside");
+
+    let remote = Remote::new(
+        "testhost".into(),
+        Reach::Direct(local_agent()),
+        Ask::Path(temp.path().to_path_buf()),
+    );
+    let source = Source::Remote(std::sync::Arc::new(remote));
+    let (view, cx) = cx.add_window_view(move |_, cx| {
+        Disktree::with_source(source, PathBuf::new(), options(), 3, cx)
+    });
+    let focus = view.read_with(cx, |app, _| app.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    draw(cx);
+    assert!(
+        read(&view, cx, |app| app.connecting.is_some()),
+        "the window opens before the host has answered"
+    );
+
+    finish_connect(&view, cx);
+    assert_eq!(read(&view, cx, |app| app.root_path.clone()), root);
+    finish_scan(&view, cx);
+    draw(cx);
+
+    let (bytes, files, space, trail, shown) = read(&view, cx, |app| {
+        let tree = app.tree().expect("tree");
+        (
+            tree.bytes,
+            tree.files,
+            app.space.is_some(),
+            app.breadcrumbs()[0].0.clone(),
+            crate::widgets::display_root(app),
+        )
+    });
+    assert_eq!(bytes, 606_000, "every fixture byte, through the agent");
+    assert_eq!(files, 5);
+    assert!(space, "free space is read on the agent");
+    assert_eq!(trail, "testhost:/", "the trail starts at the host");
+    assert_eq!(shown, format!("testhost:{}", root.display()));
+
+    // Mark junk, swap/deeper, and a path outside the root, which the
+    // agent's plan keeps back.
+    update(&view, cx, |app, cx| {
+        app.removal_mode = RemovalMode::Permanent;
+        let child = |app: &Disktree, name: &str| {
+            app.tree()
+                .and_then(|tree| {
+                    tree.children.iter().position(|c| &*c.name == name)
+                })
+                .expect(name)
+        };
+        let junk = vec![child(app, "junk")];
+        let swap = child(app, "swap");
+        app.toggle_mark(&junk, cx);
+        app.toggle_mark(&[swap, 0], cx);
+        app.marks.toggle(disktree_core::removal::Target {
+            path: outside.path().to_path_buf(),
+            bytes: 1,
+            is_dir: true,
+            hidden: false,
+        });
+        let plan = app.plan();
+        assert_eq!(plan.targets.len(), 2, "{plan:?}");
+        assert_eq!(plan.blocked.len(), 1, "{plan:?}");
+        assert!(
+            plan.blocked[0].reason.contains("outside the scanned root"),
+            "{plan:?}"
+        );
+    });
+
+    // After the review was planned, `swap` becomes a link out of the root.
+    // The app's plan still lists swap/deeper; the agent plans again and
+    // refuses it.
+    std::fs::rename(root.join("swap"), outside.path().join("swap"))
+        .expect("move swap out");
+    std::os::unix::fs::symlink(outside.path().join("swap"), root.join("swap"))
+        .expect("link swap");
+
+    press(cx, "c");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+    press(cx, "enter");
+    assert!(read(&view, cx, |app| app.confirm_open));
+    press(cx, "enter");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Running);
+
+    let epoch = read(&view, cx, |app| app.run_epoch);
+    let mut finished = false;
+    for _ in 0..2_000 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        finished = update(&view, cx, |app, cx| {
+            app.poll_removal_once(epoch, cx);
+            app.screen == Screen::Done
+        });
+        if finished {
+            break;
+        }
+    }
+    assert!(finished, "the removal finished");
+    draw(cx);
+
+    let (summary, log) = read(&view, cx, |app| {
+        (app.run_summary.clone(), app.run_log.clone())
+    });
+    assert_eq!(summary.removed, 1, "{summary:?} {log:?}");
+    assert_eq!(summary.failed, 1, "{summary:?} {log:?}");
+    assert!(
+        log.iter().any(|(path, outcome)| {
+            path.ends_with("swap/deeper")
+                && outcome
+                    .as_ref()
+                    .is_err_and(|error| error.starts_with("refused: "))
+        }),
+        "{log:?}"
+    );
+    assert!(!root.join("junk").exists(), "junk is gone");
+    assert!(root.join("keep/notes.txt").exists(), "unmarked, untouched");
+    assert!(
+        outside.path().join("swap/deeper/more.bin").exists(),
+        "what the link led to is untouched"
+    );
+    assert!(outside.path().exists(), "the kept-back mark is untouched");
+}

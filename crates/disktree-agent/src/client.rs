@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use disktree_core::git::GitState;
 use disktree_core::removal::{Plan, RemovalEvent, RemovalMode, Target};
 use disktree_core::scan::{ScanOptions, ScanSnapshot};
 use disktree_core::space::Volume;
@@ -27,7 +28,7 @@ use disktree_core::tree::Node;
 use ruzstd::decoding::StreamingDecoder;
 
 use crate::protocol::{
-    Hello, PROTOCOL, Reply, Request, SpaceReport, read_preamble, tag,
+    Hello, PROTOCOL, PathInfo, Reply, Request, SpaceReport, read_preamble, tag,
 };
 use crate::tree_codec::{CHUNK, TreeBuilder};
 use crate::wire::{invalid, read_frame};
@@ -139,6 +140,12 @@ impl Client {
         &self.hello
     }
 
+    /// Why the connection ended, once it has: every request from then on
+    /// fails with this.
+    pub fn closed(&self) -> Option<String> {
+        lock(&self.shared.routes).closed.clone()
+    }
+
     /// Start walking `root` on the agent's machine.
     pub fn scan(&self, root: &Path, options: &ScanOptions) -> RemoteScan {
         let (id, replies) = self.shared.open(&Request::Scan {
@@ -186,6 +193,27 @@ impl Client {
     pub fn volumes(&self) -> io::Result<Vec<Volume>> {
         match self.shared.call(&Request::Volumes)? {
             Reply::Volumes(volumes) => Ok(volumes),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// What git there says about the checkout at `path`; `None` when it
+    /// is not one or git is not installed there.
+    pub fn git_state(&self, path: &Path) -> io::Result<Option<GitState>> {
+        match self.shared.call(&Request::GitState {
+            path: path.to_path_buf(),
+        })? {
+            Reply::GitState(state) => Ok(state),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// What is at `path` there.
+    pub fn path_info(&self, path: &Path) -> io::Result<PathInfo> {
+        match self.shared.call(&Request::PathInfo {
+            path: path.to_path_buf(),
+        })? {
+            Reply::PathInfo(info) => Ok(info),
             other => Err(unexpected(&other)),
         }
     }

@@ -13,6 +13,7 @@
 use std::io;
 use std::path::PathBuf;
 
+use disktree_core::git::GitState;
 use disktree_core::removal::{
     Blocked, Plan, RemovalEvent, RemovalMode, Target, TrashBackend,
 };
@@ -24,7 +25,9 @@ use disktree_core::tree::Metric;
 use crate::wire::{Decoder, Encoder, invalid};
 
 /// Bumped on any change to a message's layout; see [`preamble`].
-pub const PROTOCOL: u32 = 1;
+///
+/// 2: git state, and what is at a path.
+pub const PROTOCOL: u32 = 2;
 
 /// What an agent's output starts with: anything else on its stdout (a
 /// login banner, a shell error) is not an agent.
@@ -40,8 +43,8 @@ pub mod tag {
     pub const PLAN: u8 = 7;
     pub const REMOVAL: u8 = 8;
     pub const VOLUMES: u8 = 9;
-    /// Reserved for the repository state the app shows beside a tile.
     pub const GIT_STATE: u8 = 10;
+    pub const PATH_INFO: u8 = 11;
 
     pub const SCAN: u8 = 32;
     pub const CANCEL: u8 = 33;
@@ -49,8 +52,8 @@ pub mod tag {
     pub const PLAN_FOR: u8 = 35;
     pub const REMOVE: u8 = 36;
     pub const LIST_VOLUMES: u8 = 37;
-    /// Reserved: asks for [`GIT_STATE`].
     pub const GIT_STATE_OF: u8 = 38;
+    pub const PATH_INFO_OF: u8 = 39;
 }
 
 /// What an agent says about itself and its machine before anything else.
@@ -82,6 +85,17 @@ pub struct SpaceReport {
     pub volume_root: Option<PathBuf>,
 }
 
+/// What is at a path, as the app checks a root it was given.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathInfo {
+    /// Every link and `..` resolved; `None` when that fails.
+    pub canonical: Option<PathBuf>,
+    /// Whether it is a directory, links followed; why not, when unreadable.
+    pub is_dir: Result<bool, String>,
+    /// Whether anything is there, the link itself counting.
+    pub exists: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum Request {
     Scan {
@@ -105,6 +119,13 @@ pub enum Request {
         mode: RemovalMode,
     },
     Volumes,
+    /// What git says about the checkout at `path`.
+    GitState {
+        path: PathBuf,
+    },
+    PathInfo {
+        path: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +145,9 @@ pub enum Reply {
     Plan(Plan),
     Removal(RemovalEvent),
     Volumes(Vec<Volume>),
+    /// `None` when it is not a checkout or git is not installed there.
+    GitState(Option<GitState>),
+    PathInfo(PathInfo),
 }
 
 /// The first bytes an agent writes, before any frame: [`MAGIC`] and its
@@ -249,6 +273,14 @@ impl Request {
                 tag::REMOVE
             }
             Self::Volumes => tag::LIST_VOLUMES,
+            Self::GitState { path } => {
+                out.path(path);
+                tag::GIT_STATE_OF
+            }
+            Self::PathInfo { path } => {
+                out.path(path);
+                tag::PATH_INFO_OF
+            }
         };
         (tag, out.buf)
     }
@@ -283,6 +315,12 @@ impl Request {
                 },
             },
             tag::LIST_VOLUMES => Self::Volumes,
+            tag::GIT_STATE_OF => Self::GitState {
+                path: input.path()?,
+            },
+            tag::PATH_INFO_OF => Self::PathInfo {
+                path: input.path()?,
+            },
             _ => return Ok((id, None)),
         };
         Ok((id, Some(request)))
@@ -301,7 +339,9 @@ impl Reply {
             | Self::Failed { .. }
             | Self::Space(_)
             | Self::Plan(_)
-            | Self::Volumes(_) => true,
+            | Self::Volumes(_)
+            | Self::GitState(_)
+            | Self::PathInfo(_) => true,
         }
     }
 
@@ -362,6 +402,29 @@ impl Reply {
                 put_volumes(&mut out, volumes);
                 tag::VOLUMES
             }
+            Self::GitState(state) => {
+                out.option(state.as_ref(), |out, state| {
+                    out.option(state.changed, Encoder::usize);
+                    out.usize(state.stashes);
+                    out.option(state.unpushed, Encoder::usize);
+                });
+                tag::GIT_STATE
+            }
+            Self::PathInfo(info) => {
+                out.option(info.canonical.as_deref(), Encoder::path);
+                match &info.is_dir {
+                    Ok(is_dir) => {
+                        out.bool(true);
+                        out.bool(*is_dir);
+                    }
+                    Err(message) => {
+                        out.bool(false);
+                        out.str(message);
+                    }
+                }
+                out.bool(info.exists);
+                tag::PATH_INFO
+            }
         };
         (tag, out.buf)
     }
@@ -409,6 +472,22 @@ impl Reply {
             }
             tag::REMOVAL => Self::Removal(take_event(&mut input)?),
             tag::VOLUMES => Self::Volumes(take_volumes(&mut input)?),
+            tag::GIT_STATE => Self::GitState(input.option(|input| {
+                Ok(GitState {
+                    changed: input.option(Decoder::usize)?,
+                    stashes: input.usize()?,
+                    unpushed: input.option(Decoder::usize)?,
+                })
+            })?),
+            tag::PATH_INFO => Self::PathInfo(PathInfo {
+                canonical: input.option(Decoder::path)?,
+                is_dir: if input.bool()? {
+                    Ok(input.bool()?)
+                } else {
+                    Err(input.string()?)
+                },
+                exists: input.bool()?,
+            }),
             _ => return Ok((id, None)),
         };
         Ok((id, Some(reply)))

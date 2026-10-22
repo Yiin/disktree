@@ -8,6 +8,7 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use disktree_core::filter::{Keep, Matches, filter};
@@ -29,7 +30,7 @@ use gpui_kit::{
 use gpui_omarchy::Status;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::git::GitState;
+use disktree_core::git::GitState;
 
 use crate::marks::{Marks, display_path, is_hidden};
 use crate::source::{Source, SourceRemoval, SourceScan};
@@ -338,6 +339,11 @@ pub struct Disktree {
     pub cpu_threads: usize,
     pub tree: Option<Arc<Node>>,
     pub scan: Option<SourceScan>,
+    /// A remote source is being connected; the outcome arrives here. The
+    /// scan starts once it has.
+    pub connecting: Option<Receiver<Result<(), String>>>,
+    /// The lost connection was said in the notice line, once.
+    lost_told: bool,
     pub scan_epoch: u64,
     pub progress: ScanSnapshot,
     pub scan_error: Option<String>,
@@ -493,6 +499,8 @@ impl Disktree {
             cpu_threads: crate::power::cpu_threads(),
             tree: None,
             scan: None,
+            connecting: None,
+            lost_told: false,
             scan_epoch: 0,
             progress: ScanSnapshot::default(),
             scan_error: None,
@@ -567,6 +575,13 @@ impl Disktree {
             scan_elapsed: None,
             scanned_at: now_seconds(),
         };
+        Self::start_space_ticker(cx);
+        // Another machine: what is there is known once it has answered,
+        // and `connected` then does what follows for it.
+        if !tree.source.is_ready() {
+            tree.connect(cx);
+            return tree;
+        }
         tree.device = tree.source.device(&tree.root_path);
         tree.full_disk_access = tree
             .home
@@ -578,8 +593,115 @@ impl Disktree {
         tree.file_table = tree.source.file_table_readable(&tree.root_path);
         tree.source.prime_mount_points();
         tree.start_scan(cx);
-        Self::start_space_ticker(cx);
         tree
+    }
+
+    /// Connect the remote source off the UI thread; the scanning screen
+    /// says what it is doing meanwhile. A scan follows once it is up.
+    fn connect(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(scan) = self.scan.take() {
+            scan.cancel();
+        }
+        self.scan_epoch += 1;
+        let epoch = self.scan_epoch;
+        self.progress = ScanSnapshot::default();
+        self.scan_error = None;
+        self.scan_started = Some(Instant::now());
+        self.scan_elapsed = None;
+        let (sender, outcome) = mpsc::channel();
+        let source = self.source.clone();
+        let spawned = std::thread::Builder::new()
+            .name("disktree-connect".into())
+            .spawn(move || {
+                let _ = sender.send(source.connect());
+            });
+        if let Err(error) = spawned {
+            self.scan_error = Some(format!("could not connect: {error}"));
+            cx.notify();
+            return;
+        }
+        self.connecting = Some(outcome);
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(110))
+                    .await;
+                let keep_going = this
+                    .update(cx, |this, cx| this.poll_connect_once(epoch, cx))
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Take the connection's outcome, if it has arrived. Returns whether
+    /// to keep asking; driven by the task above, and by the tests.
+    pub(crate) fn poll_connect_once(
+        &mut self,
+        epoch: u64,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if epoch != self.scan_epoch {
+            return false;
+        }
+        let Some(outcome) = &self.connecting else {
+            return false;
+        };
+        let outcome = match outcome.try_recv() {
+            Ok(outcome) => outcome,
+            Err(TryRecvError::Empty) => {
+                // The stage line changes while it runs.
+                cx.notify();
+                return true;
+            }
+            Err(TryRecvError::Disconnected) => {
+                Err("the connection attempt stopped".to_owned())
+            }
+        };
+        self.connecting = None;
+        match outcome.and_then(|()| self.connected_root()) {
+            Ok(root) => {
+                self.lost_told = false;
+                self.set_root(root, cx);
+            }
+            Err(error) => {
+                self.scan_error = Some(error);
+                self.progress.finished = true;
+                self.scan_elapsed =
+                    self.scan_started.map(|started| started.elapsed());
+            }
+        }
+        cx.notify();
+        false
+    }
+
+    /// The root to scan now that the source is connected: the one on
+    /// screen when reconnecting, else what the command line asked for,
+    /// resolved and checked there. The first time, what the host says
+    /// about itself replaces what was assumed before it answered.
+    fn connected_root(&mut self) -> Result<PathBuf, String> {
+        if !self.root_path.as_os_str().is_empty() {
+            return Ok(self.root_path.clone());
+        }
+        let root = self.source.canonical(self.source.first_root()?);
+        let shown = format!("{}:{}", self.source.name(), root.display());
+        match self.source.is_dir(&root) {
+            Ok(true) => {}
+            Ok(false) => return Err(format!("{shown} is not a directory")),
+            Err(error) => return Err(format!("cannot read {shown}: {error}")),
+        }
+        self.home = self.source.home();
+        self.trash_backend = self.source.trash_backend();
+        self.removal_mode = if self.trash_backend.is_available() {
+            RemovalMode::Trash
+        } else {
+            RemovalMode::Permanent
+        };
+        Ok(root)
     }
 
     /// Build a view over a tree that is already known.
@@ -806,6 +928,16 @@ impl Disktree {
     /// were the whole one: a first scan leaves the panel saying it stopped,
     /// and a widening scan leaves the tree it started from on screen.
     pub fn cancel_scan(&mut self, cx: &mut Context<'_, Self>) {
+        // Connecting is left to finish on its own; the scan that would
+        // follow it does not start.
+        if self.connecting.take().is_some() {
+            self.scan_epoch += 1;
+            self.progress.cancelled = true;
+            self.scan_elapsed =
+                self.scan_started.map(|started| started.elapsed());
+            cx.notify();
+            return;
+        }
         let Some(scan) = self.scan.take() else {
             return;
         };
@@ -920,8 +1052,13 @@ impl Disktree {
         true
     }
 
-    /// Start a fresh scan, abandoning any walk still in progress.
+    /// Start a fresh scan, abandoning any walk still in progress. A remote
+    /// source that is not connected, or no longer, is connected first.
     pub fn start_scan(&mut self, cx: &mut Context<'_, Self>) {
+        if !self.source.is_ready() {
+            self.connect(cx);
+            return;
+        }
         if let Some(scan) = &self.scan {
             scan.cancel();
         }
@@ -1064,6 +1201,10 @@ impl Disktree {
                 cx.background_executor().timer(interval).await;
                 let ok = this
                     .update(cx, |this, cx| {
+                        this.tell_if_lost(cx);
+                        if this.root_path.as_os_str().is_empty() {
+                            return;
+                        }
                         let fresh = this.source.space(&this.root_path);
                         if fresh != this.space {
                             this.space = fresh;
@@ -1077,6 +1218,27 @@ impl Disktree {
             }
         })
         .detach();
+    }
+
+    /// Say once that the connection to another machine was lost, and how
+    /// to get it back. The tree on screen stays: it is what was there.
+    fn tell_if_lost(&mut self, cx: &mut Context<'_, Self>) {
+        if self.lost_told || self.connecting.is_some() {
+            return;
+        }
+        let Some(reason) = self.source.lost() else {
+            return;
+        };
+        self.lost_told = true;
+        self.notice = Some((
+            format!(
+                "lost the connection to {}: {reason}. Press r to reconnect \
+                 and scan again",
+                self.source.name()
+            ),
+            Status::Error,
+        ));
+        cx.notify();
     }
 
     // ── navigation ──────────────────────────────────────────────────────
@@ -1121,6 +1283,12 @@ impl Disktree {
             .map(|path| (crumb_label(path), Crumb::Above(path.to_path_buf())))
             .collect();
         trail.push((crumb_label(&self.root_path), Crumb::Tree(Vec::new())));
+        // Another machine's trail starts at its name: `spark-1:/`.
+        if let Some(host) = self.source.host()
+            && let Some((first, _)) = trail.first_mut()
+        {
+            *first = format!("{host}:{first}");
+        }
         let Some(tree) = &self.tree else {
             return trail;
         };

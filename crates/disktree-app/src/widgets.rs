@@ -19,7 +19,11 @@ use crate::state::Disktree;
 
 /// The scanned root, shortened to `~` where it is the home directory.
 pub fn display_root(app: &Disktree) -> String {
-    crate::marks::display_path(&app.root_path, app.home.as_deref())
+    let shown = crate::marks::display_path(&app.root_path, app.home.as_deref());
+    match app.source.host() {
+        Some(host) => format!("{host}:{shown}"),
+        None => shown,
+    }
 }
 
 /// File counts, which is what a directory count is too.

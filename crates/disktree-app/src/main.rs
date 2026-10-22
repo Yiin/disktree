@@ -13,10 +13,10 @@
 
 mod app_menu;
 mod appearance;
-mod git;
 mod marks;
 mod palette;
 mod power;
+mod remote;
 mod source;
 mod state;
 #[cfg(test)]
@@ -26,7 +26,7 @@ mod ui;
 mod views;
 mod widgets;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::{
     io::IsTerminal as _,
@@ -37,6 +37,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use disktree_core::scan::ScanOptions;
 use gpui_kit::{AppContext as _, WindowOptions, px, size};
+use remote::{Ask, Reach, Remote};
 use source::Source;
 use state::Disktree;
 
@@ -44,6 +45,7 @@ use state::Disktree;
 #[derive(Debug)]
 struct Args {
     source: Source,
+    /// Empty for another machine, whose root is known once it answers.
     root: PathBuf,
     options: ScanOptions,
     depth: u32,
@@ -54,9 +56,16 @@ const USAGE: &str = "\
 disktree — a treemap of what is using your disk
 
 usage: disktree [OPTIONS] [PATH]
+       disktree [OPTIONS] HOST[:PATH]
 
 arguments:
   PATH              directory to scan (default: the home directory)
+  HOST[:PATH]       scan another machine over ssh, as scp names it: a
+                    ':' before any '/' means HOST:PATH, and a bare word
+                    that is no local path is a HOST. PATH there defaults
+                    to the real disk on SparkOS, else the home directory;
+                    a relative one starts in that home directory. Write
+                    ./NAME for a local folder named like a host.
 
 The window opens on a treemap of the root, largest first. Space marks the
 selected tile, Enter opens it, c reviews the marked list, ? lists every key.
@@ -66,6 +75,8 @@ options:
   -l, --follow-links    follow symlinks
   -H, --no-hidden       skip dotfiles and dot-directories
   -D, --disk            scan the whole disk the home directory is on
+      --sudo            on a HOST, scan as root through sudo -n, which must
+                        not ask for a password there
   -X, --cross-filesystems
                         also measure other disks, network shares and pseudo
                         filesystems mounted below PATH (off by default)
@@ -215,7 +226,8 @@ fn parse_args_with_power(
     mut args: impl Iterator<Item = std::ffi::OsString>,
     preset: power::PowerEfficiency,
 ) -> Result<Args> {
-    let mut root: Option<PathBuf> = None;
+    let mut root: Option<std::ffi::OsString> = None;
+    let mut sudo = false;
     let mut options = ScanOptions {
         threads: preset.policy(power::cpu_threads()),
         ..ScanOptions::default()
@@ -246,6 +258,7 @@ fn parse_args_with_power(
             "-x" | "--one-filesystem" => options.one_filesystem = true,
             "-X" | "--cross-filesystems" => options.one_filesystem = false,
             "-D" | "--disk" => disk = true,
+            "--sudo" => sudo = true,
             "-d" | "--depth" => {
                 let value = text(args.next(), "--depth needs a number")?;
                 depth = value.parse().context("--depth needs a number")?;
@@ -326,11 +339,40 @@ fn parse_args_with_power(
             }
             _ => {
                 anyhow::ensure!(root.is_none(), "only one path can be scanned");
-                root = Some(PathBuf::from(arg));
+                root = Some(arg);
             }
         }
     }
 
+    let place = root.map(|root| place(root, Path::exists));
+    if let Some(Place::Remote { host, path }) = place.clone() {
+        anyhow::ensure!(
+            !(disk && path.is_some()),
+            "--disk and a PATH cannot be combined"
+        );
+        let ask = match path {
+            Some(path) => Ask::Path(path),
+            None if disk => Ask::Disk,
+            None => Ask::Default,
+        };
+        let remote = Remote::new(host, Reach::Ssh { sudo }, ask);
+        return Ok(Args {
+            source: Source::Remote(std::sync::Arc::new(remote)),
+            root: PathBuf::new(),
+            options,
+            depth: depth.clamp(1, 6),
+            power,
+        });
+    }
+    anyhow::ensure!(
+        !sudo,
+        "--sudo is for another machine (disktree HOST --sudo); here, run \
+         disktree itself as root"
+    );
+    let root = place.map(|place| match place {
+        Place::Local(path) => path,
+        Place::Remote { .. } => unreachable!("handled above"),
+    });
     anyhow::ensure!(
         !(disk && root.is_some()),
         "--disk and a PATH cannot be combined"
@@ -361,6 +403,47 @@ fn parse_args_with_power(
         depth: depth.clamp(1, 6),
         power,
     })
+}
+
+/// Where the root argument points: here, or at another machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Place {
+    Local(PathBuf),
+    /// `path` is `None` for `host` and `host:`: the default root there.
+    Remote {
+        host: String,
+        path: Option<PathBuf>,
+    },
+}
+
+/// scp's rule. A `:` before any `/` makes `host:path`; a bare word with no
+/// `/` that `exists` does not find here is a host; everything else is a
+/// local path, so `./spark-1` is the folder.
+fn place(arg: std::ffi::OsString, exists: impl Fn(&Path) -> bool) -> Place {
+    let Some(text) = arg.to_str() else {
+        return Place::Local(PathBuf::from(arg));
+    };
+    let separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+    let slash = text.find(separator).unwrap_or(text.len());
+    if let Some(colon) = text[..slash].find(':') {
+        let (host, path) = (&text[..colon], &text[colon + 1..]);
+        // `C:\Users` is a drive on Windows, not a host named C.
+        let drive = cfg!(windows) && host.len() == 1;
+        if !host.is_empty() && !drive {
+            return Place::Remote {
+                host: host.to_owned(),
+                path: (!path.is_empty()).then(|| PathBuf::from(path)),
+            };
+        }
+    }
+    let bare = slash == text.len() && !matches!(text, "" | "." | ".." | "~");
+    if bare && !exists(Path::new(text)) {
+        return Place::Remote {
+            host: text.to_owned(),
+            path: None,
+        };
+    }
+    Place::Local(PathBuf::from(arg))
 }
 
 /// The console of the terminal disktree was started from, if any: a
@@ -490,6 +573,63 @@ mod argument_tests {
         .expect("native path");
         assert_eq!(args.root, dunce::canonicalize(root).expect("root"));
         assert_eq!(args.options.threads.max_threads, 4);
+    }
+
+    #[test]
+    fn a_host_is_named_the_way_scp_names_one() {
+        let remote = |host: &str, path: Option<&str>| Place::Remote {
+            host: host.into(),
+            path: path.map(PathBuf::from),
+        };
+        let local = |path: &str| Place::Local(PathBuf::from(path));
+        let here = |path: &Path| path == Path::new("projects");
+        for (arg, expected) in [
+            ("spark-1", remote("spark-1", None)),
+            ("me@spark-1", remote("me@spark-1", None)),
+            ("spark-1:", remote("spark-1", None)),
+            (
+                "spark-1:/srv/models",
+                remote("spark-1", Some("/srv/models")),
+            ),
+            ("spark-1:models", remote("spark-1", Some("models"))),
+            // A ':' after a '/' is part of a local name.
+            ("./spark-1", local("./spark-1")),
+            ("dir/a:b", local("dir/a:b")),
+            ("/abs/path", local("/abs/path")),
+            // A local folder named like a host stays local.
+            ("projects", local("projects")),
+            (".", local(".")),
+            ("..", local("..")),
+        ] {
+            assert_eq!(place(arg.into(), here), expected, "{arg}");
+        }
+    }
+
+    #[test]
+    fn a_host_on_the_command_line_makes_a_remote_source() {
+        let args = |list: &[&str]| {
+            parse_args(list.iter().copied().map(std::ffi::OsString::from))
+        };
+        let parsed = args(&["--sudo", "spark-1:/srv"]).expect("remote");
+        let Source::Remote(remote) = &parsed.source else {
+            panic!("not remote: {parsed:?}");
+        };
+        assert_eq!(remote.host, "spark-1");
+        assert_eq!(remote.reach, Reach::Ssh { sudo: true });
+        assert_eq!(remote.ask, Ask::Path(PathBuf::from("/srv")));
+        assert!(parsed.root.as_os_str().is_empty(), "known once connected");
+
+        let disk = args(&["-D", "spark-1"]).expect("remote disk");
+        let Source::Remote(remote) = &disk.source else {
+            panic!("not remote: {disk:?}");
+        };
+        assert_eq!(remote.ask, Ask::Disk);
+        assert_eq!(remote.reach, Reach::Ssh { sudo: false });
+
+        assert!(args(&["-D", "spark-1:/srv"]).is_err());
+        assert!(args(&["--sudo", "."]).is_err(), "sudo is for a host");
+        let here = args(&["."]).expect("local");
+        assert!(here.source.is_local());
     }
 
     #[test]

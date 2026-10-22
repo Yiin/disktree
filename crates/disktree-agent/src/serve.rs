@@ -18,7 +18,9 @@ use disktree_core::space;
 use rayon::prelude::*;
 use ruzstd::encoding::{CompressionLevel, compress_to_vec};
 
-use crate::protocol::{Hello, PROTOCOL, Reply, Request, SpaceReport, preamble};
+use crate::protocol::{
+    Hello, PROTOCOL, PathInfo, Reply, Request, SpaceReport, preamble,
+};
 use crate::tree_codec::{CHUNK, encode_tree};
 use crate::wire::{read_frame, write_frame};
 
@@ -156,6 +158,11 @@ impl Agent {
             } => self.remove(id, &root, &targets, mode, cancel),
             Request::Volumes => {
                 self.send(id, &Reply::Volumes(space::volumes()))
+            }
+            Request::GitState { path } => self
+                .send(id, &Reply::GitState(disktree_core::git::state(&path))),
+            Request::PathInfo { path } => {
+                self.send(id, &Reply::PathInfo(path_info(&path)))
             }
             Request::Cancel => Ok(()),
         }
@@ -314,6 +321,16 @@ fn space_report(path: &Path) -> SpaceReport {
         space: space::space_info(path).map_err(|error| error.to_string()),
         device: space::device_for(path),
         volume_root: space::volume_root_for(path),
+    }
+}
+
+fn path_info(path: &Path) -> PathInfo {
+    PathInfo {
+        canonical: std::fs::canonicalize(path).ok(),
+        is_dir: std::fs::metadata(path)
+            .map(|metadata| metadata.is_dir())
+            .map_err(|error| error.to_string()),
+        exists: std::fs::symlink_metadata(path).is_ok(),
     }
 }
 

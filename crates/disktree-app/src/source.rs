@@ -1,9 +1,9 @@
 //! Where the scanned disk is: the one door from the app to a filesystem.
 //!
 //! Every read of the disk being explored and every change to it goes through
-//! [`Source`], so a disk on another machine needs one new arm per method and
-//! no change in the screens. Methods take and return plain data, never a
-//! handle that only works on this machine.
+//! [`Source`]: this machine's disk, or another's through its agent
+//! ([`crate::remote`]). Methods take and return plain data, never a handle
+//! that only works on this machine.
 //!
 //! What a source provides, `local only` marking what has no meaning for a
 //! disk on another machine:
@@ -22,7 +22,8 @@
 //! * the removal plan, whose guards run where the disk is
 //!   ([`Source::plan`]), and the removal itself ([`Source::remove`],
 //!   [`SourceRemoval`]); which trash it uses ([`Source::trash_backend`]);
-//! * what git knows about a checkout ([`Source::git_state`]);
+//! * whether a directory is a checkout, and what git knows about it
+//!   ([`Source::is_checkout`], [`Source::git_state`]);
 //! * the mount table primed before the first plan
 //!   ([`Source::prime_mount_points`]);
 //! * whether a whole NTFS drive can be read from its file table
@@ -33,12 +34,19 @@
 //!   choosing a folder with the system picker. These check
 //!   [`Source::is_local`].
 //!
+//! A remote source is connected before its first scan, off the UI thread
+//! ([`Source::is_ready`], [`Source::connect`]); until then it answers as a
+//! disk it cannot read.
+//!
 //! Desktop-side, not part of a source: the clipboard, the saved delete list
 //! (a file the user picks on this machine), the power settings file and the
 //! appearance settings.
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use disktree_agent::{RemoteRemoval, RemoteScan};
 
 use disktree_core::removal::{
     Plan, RemovalEvent, RemovalHandle, RemovalMode, Target, TrashBackend,
@@ -47,13 +55,16 @@ use disktree_core::scan::{Known, ScanHandle, ScanOptions, ScanSnapshot};
 use disktree_core::space::{SpaceInfo, Volume};
 use disktree_core::tree::Node;
 
-use crate::git::GitState;
+use crate::remote::Remote;
+use disktree_core::git::GitState;
 
 /// The machine whose disk is explored.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum Source {
     /// This machine, through `disktree-core` directly.
     Local,
+    /// Another machine, through the agent there.
+    Remote(Arc<Remote>),
 }
 
 impl Source {
@@ -64,9 +75,19 @@ impl Source {
     }
 
     /// The machine, as a notice names it.
-    pub const fn name(&self) -> &str {
+    pub fn name(&self) -> &str {
         match self {
             Self::Local => "this machine",
+            Self::Remote(remote) => &remote.host,
+        }
+    }
+
+    /// The host a path is on, for a trail or title that names it; `None`
+    /// for this machine, whose paths are written as they are.
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Remote(remote) => Some(&remote.host),
         }
     }
 
@@ -74,13 +95,62 @@ impl Source {
     pub fn title(&self, shown: &str) -> String {
         match self {
             Self::Local => format!("disktree · {shown}"),
+            Self::Remote(remote) => {
+                format!("disktree · {}:{shown}", remote.host)
+            }
         }
     }
 
-    /// The home directory of whoever the scan runs as.
+    /// Whether the disk can be read now. A remote source is not until it
+    /// has connected, and again once its connection is lost.
+    pub fn is_ready(&self) -> bool {
+        match self {
+            Self::Local => true,
+            Self::Remote(remote) => remote.is_up(),
+        }
+    }
+
+    /// Connect a remote source: reach the host, install the agent if it is
+    /// missing, start it. Blocks; call it off the UI thread.
+    pub fn connect(&self) -> Result<(), String> {
+        match self {
+            Self::Local => Ok(()),
+            Self::Remote(remote) => remote.connect(),
+        }
+    }
+
+    /// What connecting is doing, while it is: "Connecting to spark-1".
+    pub fn stage(&self) -> Option<String> {
+        match self {
+            Self::Local => None,
+            Self::Remote(remote) => remote.stage(),
+        }
+    }
+
+    /// Why the connection to the disk ended, once it has.
+    pub fn lost(&self) -> Option<String> {
+        match self {
+            Self::Local => None,
+            Self::Remote(remote) => remote.lost(),
+        }
+    }
+
+    /// The root to scan first, once connected, when the command line did
+    /// not give this machine's: what it asked for, resolved there.
+    pub fn first_root(&self) -> Result<PathBuf, String> {
+        match self {
+            Self::Local => std::env::home_dir()
+                .ok_or_else(|| "no home directory".to_owned()),
+            Self::Remote(remote) => remote.first_root(),
+        }
+    }
+
+    /// The home directory of whoever the scan runs as; on another machine
+    /// under `--sudo`, still the ssh user's.
     pub fn home(&self) -> Option<PathBuf> {
         match self {
             Self::Local => std::env::home_dir(),
+            Self::Remote(remote) => remote.hello()?.home,
         }
     }
 
@@ -91,6 +161,11 @@ impl Source {
     pub fn canonical(&self, root: PathBuf) -> PathBuf {
         match self {
             Self::Local => dunce::canonicalize(&root).unwrap_or(root),
+            Self::Remote(remote) => remote
+                .path_info(&root)
+                .ok()
+                .and_then(|info| info.canonical)
+                .unwrap_or(root),
         }
     }
 
@@ -98,6 +173,10 @@ impl Source {
     pub fn is_dir(&self, path: &Path) -> io::Result<bool> {
         match self {
             Self::Local => Ok(std::fs::metadata(path)?.is_dir()),
+            Self::Remote(remote) => remote
+                .path_info(path)
+                .and_then(|info| info.is_dir)
+                .map_err(io::Error::other),
         }
     }
 
@@ -105,6 +184,19 @@ impl Source {
     pub fn exists(&self, path: &Path) -> bool {
         match self {
             Self::Local => std::fs::symlink_metadata(path).is_ok(),
+            Self::Remote(remote) => {
+                remote.path_info(path).is_ok_and(|info| info.exists)
+            }
+        }
+    }
+
+    /// Whether `node`, the directory at `path`, is the top of a checkout.
+    /// There, from the tree: a `.git` among its entries. A tree scanned
+    /// without hidden entries has none to show.
+    pub fn is_checkout(&self, path: &Path, node: &Node) -> bool {
+        match self {
+            Self::Local => disktree_core::git::is_checkout(path),
+            Self::Remote(_) => node.child_named(".git").is_some(),
         }
     }
 
@@ -119,13 +211,26 @@ impl Source {
             Self::Local => {
                 SourceScan::Local(ScanHandle::spawn_with(root, options, known))
             }
+            // The agent walks the wider root whole; reusing what is known
+            // there is dt-lo9.8.
+            Self::Remote(remote) => match remote.client() {
+                Some(client) => {
+                    SourceScan::Remote(client.scan(&root, &options))
+                }
+                None => SourceScan::Unreachable(format!(
+                    "not connected to {}",
+                    remote.host
+                )),
+            },
         }
     }
 
     /// Free space on the volume holding `path`, `None` when unreadable.
+    /// On another machine, the last reading, while the next is asked for.
     pub fn space(&self, path: &Path) -> Option<SpaceInfo> {
         match self {
             Self::Local => disktree_core::space::space_info(path).ok(),
+            Self::Remote(remote) => remote.report(path)?.space.ok(),
         }
     }
 
@@ -133,6 +238,7 @@ impl Source {
     pub fn device(&self, path: &Path) -> Option<String> {
         match self {
             Self::Local => disktree_core::space::device_for(path),
+            Self::Remote(remote) => remote.report(path)?.device,
         }
     }
 
@@ -140,6 +246,7 @@ impl Source {
     pub fn volume_root(&self, path: &Path) -> Option<PathBuf> {
         match self {
             Self::Local => disktree_core::space::volume_root_for(path),
+            Self::Remote(remote) => remote.report(path)?.volume_root,
         }
     }
 
@@ -150,6 +257,10 @@ impl Source {
     pub fn volumes_besides(&self, root: &Path) -> Vec<Volume> {
         let mut volumes = match self {
             Self::Local => disktree_core::space::volumes(),
+            Self::Remote(remote) => remote
+                .client()
+                .and_then(|client| client.volumes().ok())
+                .unwrap_or_default(),
         };
         if let Some(point) = self.volume_root(root)
             && !volumes.iter().any(|volume| volume.point == point)
@@ -173,13 +284,16 @@ impl Source {
     pub fn file_table_readable(&self, root: &Path) -> bool {
         match self {
             Self::Local => disktree_core::access::file_table_readable(root),
+            Self::Remote(_) => false,
         }
     }
 
     /// Read the mount table now, so the first plan does not wait on it.
+    /// An agent does that itself as it starts.
     pub fn prime_mount_points(&self) {
         match self {
             Self::Local => disktree_core::removal::prime_mount_points(),
+            Self::Remote(_) => {}
         }
     }
 
@@ -187,6 +301,9 @@ impl Source {
     pub fn trash_backend(&self) -> TrashBackend {
         match self {
             Self::Local => disktree_core::removal::detect_trash_backend(),
+            Self::Remote(remote) => remote
+                .hello()
+                .map_or(TrashBackend::Unavailable, |hello| hello.trash),
         }
     }
 
@@ -195,22 +312,48 @@ impl Source {
     pub fn plan(&self, targets: &[Target], root: &Path) -> Plan {
         match self {
             Self::Local => disktree_core::removal::plan(targets, root),
+            Self::Remote(remote) => remote.plan(targets, root),
         }
     }
 
-    /// Carry out `plan` on a worker.
+    /// Carry out `plan` on a worker. On another machine the agent plans
+    /// the targets again and removes only what its own plan allows.
     pub fn remove(&self, plan: Plan, mode: RemovalMode) -> SourceRemoval {
         match self {
             Self::Local => {
                 SourceRemoval::Local(disktree_core::removal::spawn(plan, mode))
             }
+            Self::Remote(remote) => match remote.client() {
+                Some(client) => {
+                    SourceRemoval::Remote(client.remove(&plan, mode))
+                }
+                None => {
+                    SourceRemoval::Unreachable(std::sync::Mutex::new(vec![
+                        RemovalEvent::Done {
+                            removed: 0,
+                            bytes: 0,
+                            failed: plan.targets.len(),
+                        },
+                        RemovalEvent::Item {
+                            path: plan.root,
+                            bytes: 0,
+                            outcome: Err(format!(
+                                "not connected to {}",
+                                remote.host
+                            )),
+                        },
+                    ]))
+                }
+            },
         }
     }
 
-    /// What git knows about `path`, `None` when it is not a checkout.
+    /// What git knows about `path`, `None` when it is not a checkout or
+    /// cannot be asked.
     pub fn git_state(&self, path: &Path) -> Option<GitState> {
         match self {
-            Self::Local => crate::git::state(path),
+            Self::Local => disktree_core::git::state(path),
+            Self::Remote(remote) => remote.client()?.git_state(path).ok()?,
         }
     }
 
@@ -219,6 +362,7 @@ impl Source {
     pub fn full_disk_access(&self, home: &Path) -> Option<bool> {
         match self {
             Self::Local => disktree_core::access::full_disk_access(home),
+            Self::Remote(_) => None,
         }
     }
 
@@ -231,6 +375,7 @@ impl Source {
     pub fn administrator(&self) -> Option<bool> {
         match self {
             Self::Local => disktree_core::access::administrator(),
+            Self::Remote(_) => None,
         }
     }
 }
@@ -239,6 +384,9 @@ impl Source {
 #[derive(Debug)]
 pub enum SourceScan {
     Local(ScanHandle),
+    Remote(RemoteScan),
+    /// One that could not start, and why.
+    Unreachable(String),
 }
 
 impl SourceScan {
@@ -246,6 +394,8 @@ impl SourceScan {
     pub fn progress(&self) -> ScanSnapshot {
         match self {
             Self::Local(scan) => scan.progress.snapshot(),
+            Self::Remote(scan) => scan.progress(),
+            Self::Unreachable(_) => ScanSnapshot::default(),
         }
     }
 
@@ -253,6 +403,10 @@ impl SourceScan {
     pub fn poll(&self) -> Option<io::Result<Node>> {
         match self {
             Self::Local(scan) => scan.poll(),
+            Self::Remote(scan) => scan.poll(),
+            Self::Unreachable(reason) => {
+                Some(Err(io::Error::other(reason.clone())))
+            }
         }
     }
 
@@ -260,6 +414,8 @@ impl SourceScan {
     pub fn cancel(&self) {
         match self {
             Self::Local(scan) => scan.cancel(),
+            Self::Remote(scan) => scan.cancel(),
+            Self::Unreachable(_) => {}
         }
     }
 }
@@ -268,6 +424,9 @@ impl SourceScan {
 #[derive(Debug)]
 pub enum SourceRemoval {
     Local(RemovalHandle),
+    Remote(RemoteRemoval),
+    /// One that could not start: its events, last first.
+    Unreachable(std::sync::Mutex<Vec<RemovalEvent>>),
 }
 
 impl SourceRemoval {
@@ -275,6 +434,11 @@ impl SourceRemoval {
     pub fn poll(&self) -> Option<RemovalEvent> {
         match self {
             Self::Local(run) => run.poll(),
+            Self::Remote(run) => run.poll(),
+            Self::Unreachable(events) => events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop(),
         }
     }
 
@@ -282,6 +446,8 @@ impl SourceRemoval {
     pub fn cancel(&self) {
         match self {
             Self::Local(run) => run.cancel(),
+            Self::Remote(run) => run.cancel(),
+            Self::Unreachable(_) => {}
         }
     }
 }
