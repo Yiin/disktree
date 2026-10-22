@@ -7,6 +7,10 @@
 //!
 //! The first argument is the root; the rest is the command that starts
 //! the agent. Not a test: it needs a host, and its numbers are the point.
+//!
+//! `--barrier PATH` first waits, once connected, until PATH exists: the
+//! agent is idle until asked to scan, so a job broker can lease its pid
+//! before the disk is touched.
 
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -16,9 +20,15 @@ use disktree_agent::Client;
 use disktree_core::scan::ScanOptions;
 
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
+    let barrier = if args.peek().map(String::as_str) == Some("--barrier") {
+        args.next();
+        args.next().map(PathBuf::from)
+    } else {
+        None
+    };
     let (Some(root), Some(program)) = (args.next(), args.next()) else {
-        eprintln!("usage: remote_scan ROOT AGENT-COMMAND...");
+        eprintln!("usage: remote_scan [--barrier PATH] ROOT AGENT-COMMAND...");
         return ExitCode::from(2);
     };
     let mut command = Command::new(program);
@@ -42,6 +52,13 @@ fn main() -> ExitCode {
         hello.protocol,
         started.elapsed()
     );
+
+    if let Some(barrier) = barrier {
+        println!("waiting for {}", barrier.display());
+        while !barrier.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
 
     let scanning = Instant::now();
     let scan = client.scan(&PathBuf::from(root), &ScanOptions::default());

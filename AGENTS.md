@@ -23,6 +23,7 @@ make lint                       # rustfmt --check, then clippy --all-targets -D 
 make test                       # core and window-harness tests
 make ci                         # lint, then test
 make fmt                        # format in place
+cargo xtask agent               # static Linux agents in target/agent/
 ```
 
 `make install` is the supported way to put this on a machine: it installs the
@@ -35,6 +36,13 @@ On macOS `make install` installs `target/bundle/disktree.app` into
 `~/Applications` instead, built by `cargo xtask bundle` from
 `packaging/macos/` (the `Info.plist` template and the icon's SVG). The bundle
 identifier there keys every macOS permission grant; do not change it lightly.
+
+`cargo xtask agent` cross-builds the remote agent for aarch64 and x86_64
+musl. It needs rustup's standard library for both targets (`rustup target
+add aarch64-unknown-linux-musl x86_64-unknown-linux-musl`, run through
+rustup's cargo) and zig on `PATH` or in `ZIG`, which compiles mimalloc:
+musl's own malloc made a static agent scan 4.5 times slower. Lint and
+test build the agent for the host only and need neither.
 
 `cargo xtask lint` is the gate. It must be green before anything is called
 done, and it must not fix anything: a red local run is the same signal CI gives.
@@ -119,6 +127,10 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | what macOS lists and measures in bulk | `crates/disktree-core/src/macos.rs` — `unsafe` for `getattrlistbulk` |
 | what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — `unsafe` for Win32 |
 | reading a whole NTFS drive from its file table | `crates/disktree-core/src/mft.rs` |
+| the agent's wire format, or a new message | `crates/disktree-agent/src/protocol.rs` — bump `PROTOCOL` |
+| how a tree is encoded for the wire | `crates/disktree-agent/src/tree_codec.rs` |
+| what the agent does with a request | `crates/disktree-agent/src/serve.rs` |
+| the app's handle on a remote agent | `crates/disktree-agent/src/client.rs` |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |
