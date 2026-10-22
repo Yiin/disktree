@@ -388,6 +388,11 @@ pub fn foreign_mounts_for(root: &Path) -> Option<Vec<PathBuf>> {
     Some(foreign_mounts(&parse_mounts(&table), root))
 }
 
+/// Where `SparkOS` mounts the machine's real disk, the DGX OS root: `/` is
+/// a small overlay in memory, and `/home` and the other big folders are
+/// binds of folders on this disk.
+pub const SPARKOS_DISK: &str = "/run/sparkos/host";
+
 /// One line of `/proc/self/mountinfo`.
 ///
 /// What [`Mount`] says, plus which directory of the filesystem the mount
@@ -435,7 +440,7 @@ pub fn parse_mountinfo(table: &str) -> Vec<MountView> {
 /// The kernel writes space, tab, newline and backslash in mount fields as
 /// three octal digits after a backslash. Decoded in one pass, so a name that
 /// really contains `\040` is not decoded twice.
-fn unescape_octal(field: &str) -> String {
+pub(crate) fn unescape_octal(field: &str) -> String {
     let bytes = field.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;

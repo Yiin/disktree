@@ -164,15 +164,13 @@ fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
         return plan;
     }
     // Once per plan, not per target: the review screen plans every frame.
-    let home = std::env::home_dir().map(|home| Home::of(&home));
+    let homes = homes();
     let real_root = fs::canonicalize(&root).ok();
 
     for target in targets {
         let path = normalize(&target.path);
-        let reason =
-            refuse_with(&path, &root, home.as_ref(), mounts).or_else(|| {
-                linked(&path, &root, real_root.as_deref(), home.as_ref())
-            });
+        let reason = refuse_with(&path, &root, &homes, mounts)
+            .or_else(|| linked(&path, &root, real_root.as_deref(), &homes));
         if let Some(reason) = reason {
             plan.blocked.push(Blocked {
                 path: target.path.clone(),
@@ -387,10 +385,10 @@ const SYSTEM_TOOLS: &str = "remove it with the tool that installed it";
 #[cfg(windows)]
 const SYSTEM_TOOLS: &str = "use Settings, or the program's own uninstaller";
 
-/// The system tree the path keyed `key` is in, if any. The home directory is
+/// The system tree the path keyed `key` is in, if any. A home directory is
 /// never system, wherever it lives.
-fn system_tree(key: &Path, home: Option<&Path>) -> Option<&'static str> {
-    if home.is_some_and(|home| key.starts_with(home)) {
+fn system_tree(key: &Path, homes: &[PathBuf]) -> Option<&'static str> {
+    if homes.iter().any(|home| key.starts_with(home)) {
         return None;
     }
     system_tree_keys()
@@ -431,6 +429,48 @@ impl Home {
     }
 }
 
+/// Every home directory the guards protect: `HOME`, and the home of the
+/// account this process runs as when that is another. Under `sudo` with
+/// the caller's `HOME` kept, which is how the agent runs under `--sudo`,
+/// that is root's `/root` as well as the caller's own.
+fn homes() -> Vec<Home> {
+    let mut paths: Vec<PathBuf> = std::env::home_dir().into_iter().collect();
+    if let Some(own) = effective_home()
+        && !paths.iter().any(|path| guard_key(path) == guard_key(&own))
+    {
+        paths.push(own);
+    }
+    paths.iter().map(|path| Home::of(path)).collect()
+}
+
+/// The home directory of the effective user, from `/etc/passwd`. An
+/// account kept only in a directory service is not there, and `HOME`
+/// alone answers for it; root, the case that matters, always is.
+#[cfg(unix)]
+fn effective_home() -> Option<PathBuf> {
+    let passwd = fs::read_to_string("/etc/passwd").ok()?;
+    passwd_home(&passwd, rustix::process::geteuid().as_raw())
+}
+
+#[cfg(not(unix))]
+const fn effective_home() -> Option<PathBuf> {
+    None
+}
+
+/// The home directory `passwd` gives `uid`. Not `/`, which daemons have
+/// for none and which would make everything "contain the home directory".
+fn passwd_home(passwd: &str, uid: u32) -> Option<PathBuf> {
+    passwd
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            let home = fields.get(5)?;
+            (fields.get(2)?.parse::<u32>().ok()? == uid)
+                .then(|| PathBuf::from(home))
+        })
+        .filter(|home| home.is_absolute() && home.parent().is_some())
+}
+
 /// [`refuse_with`] for a mount table that has no disk under `/run` but
 /// the media in `media`.
 #[cfg(test)]
@@ -441,7 +481,8 @@ fn refuse(
     mounts: &[PathBuf],
     media: &[PathBuf],
 ) -> Option<String> {
-    refuse_judged(path, root, home, mounts, media, &[])
+    let homes = home.map(std::slice::from_ref).unwrap_or_default();
+    refuse_judged(path, root, homes, mounts, media, &[], &[])
 }
 
 /// Why `path` may not be removed from the tree scanned at `root`, judged
@@ -449,35 +490,47 @@ fn refuse(
 fn refuse_with(
     path: &Path,
     root: &Path,
-    home: Option<&Home>,
+    homes: &[Home],
     mounts: &MountTable,
 ) -> Option<String> {
     refuse_judged(
         path,
         root,
-        home,
+        homes,
         &mounts.points,
         &mounts.media,
         &mounts.run_disks,
+        &mounts.pinned,
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one read of the mount table, in the parts tests build alone"
+)]
 fn refuse_judged(
     path: &Path,
     root: &Path,
-    home: Option<&Home>,
+    homes: &[Home],
     mounts: &[PathBuf],
     media: &[PathBuf],
     run_disks: &[RunDisk],
+    pinned: &[Pinned],
 ) -> Option<String> {
     let key = guard_key(path);
     let root_key = guard_key(root);
-    let home_key = home.map(|home| home.key.as_path());
+    let home_keys: Vec<PathBuf> =
+        homes.iter().map(|home| home.key.clone()).collect();
     if path.parent().is_none() {
         return Some("the filesystem root cannot be removed".into());
     }
     if key == root_key {
         return Some("the scanned root cannot be removed".into());
+    }
+    // Before anything that could let it through: the running system
+    // keeps no other copy of what it boots from.
+    if let Some(reason) = pinned_by(path, &key, pinned) {
+        return Some(reason);
     }
     if cfg!(windows)
         && let Some(name) = path.components().find_map(|part| match part {
@@ -492,17 +545,16 @@ fn refuse_judged(
             name.display()
         ));
     }
-    if home_key.is_some_and(|home| key == home)
-        || home
-            .and_then(|home| home.id)
-            .is_some_and(|id| identity(path, false) == Some(id))
+    let id = identity(path, false);
+    if home_keys.contains(&key)
+        || homes.iter().any(|home| id.is_some() && home.id == id)
     {
         return Some("the home directory cannot be removed".into());
     }
     // On Linux `/home` is usually a mount point of its own and refused as
     // one; on macOS `/Users` is on the same volume as `/`, and removing it
     // would empty the home directory before failing on `/Users` itself.
-    if home_key.is_some_and(|home| home.starts_with(&key)) {
+    if home_keys.iter().any(|home| home.starts_with(&key)) {
         return Some("it contains the home directory".into());
     }
     // Elevated through another account's credentials, home is that admin's,
@@ -519,13 +571,13 @@ fn refuse_judged(
     if !key.starts_with(&root_key) && !path.starts_with(root) {
         return Some("outside the scanned root".into());
     }
-    if let Some(system) = system_tree(&key, home_key)
+    if let Some(system) = system_tree(&key, &home_keys)
         && !(system == "/run"
             && on_media(&key, mounts, media)
             && fs::canonicalize(path).is_ok_and(|real| real == path))
     {
         let on_disk = (system == "/run")
-            .then(|| on_run_disk(&key, mounts, run_disks, home_key))
+            .then(|| on_run_disk(&key, mounts, run_disks, &home_keys))
             .flatten()
             .filter(|_| fs::canonicalize(path).is_ok_and(|real| real == path));
         match on_disk {
@@ -599,7 +651,7 @@ fn linked(
     path: &Path,
     root: &Path,
     real_root: Option<&Path>,
-    home: Option<&Home>,
+    homes: &[Home],
 ) -> Option<String> {
     let (parent, name) = (path.parent()?, path.file_name()?);
     let real = guard_key(&fs::canonicalize(parent).ok()?.join(name));
@@ -611,9 +663,10 @@ fn linked(
             real.display()
         ));
     }
-    if home
-        .and_then(|home| home.real.as_ref())
-        .is_some_and(|home| home.starts_with(&real))
+    if homes
+        .iter()
+        .filter_map(|home| home.real.as_ref())
+        .any(|home| home.starts_with(&real))
     {
         return Some("it contains the home directory".into());
     }
@@ -666,6 +719,9 @@ struct MountTable {
     /// where the home trash is seen from a target's mount; see
     /// [`trash_route`]. Empty off Linux.
     views: Vec<crate::space::MountView>,
+    /// Files the running system uses as storage; see [`Pinned`]. Empty
+    /// off Linux.
+    pinned: Vec<Pinned>,
 }
 
 fn read_mount_table() -> MountTable {
@@ -679,6 +735,7 @@ fn read_mount_table() -> MountTable {
             media: media_roots(&views),
             run_disks: run_disks(&views),
             mounts,
+            pinned: read_pinned(&views),
             views,
         };
     }
@@ -688,7 +745,141 @@ fn read_mount_table() -> MountTable {
         run_disks: Vec::new(),
         mounts,
         views: Vec::new(),
+        pinned: Vec::new(),
     }
+}
+
+/// A file the running system uses as storage: the image a loop device
+/// reads, an active swap file, or a file mounted as a filesystem. Removing
+/// one goes unnoticed until the next boot, when there is nothing to boot
+/// from: `SparkOS` runs from an erofs image on a loop device and swaps to
+/// a file, both on the disk `--sudo` shows. The file and every directory
+/// holding it are refused, under any spelling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Pinned {
+    /// The file, as the kernel names it.
+    path: PathBuf,
+    key: PathBuf,
+    /// What the system does with it, said when it is refused.
+    why: String,
+    /// Device and inode of the file, so a bind's spelling of it matches.
+    id: Option<(u64, u64)>,
+    /// Device and inode of each directory above it, by its real path: a
+    /// bind or a link that reaches one of them holds the file too.
+    above: Vec<(u64, u64)>,
+}
+
+impl Pinned {
+    fn new(path: PathBuf, why: String) -> Self {
+        let real = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        Self {
+            key: guard_key(&path),
+            id: identity(&real, false),
+            above: real
+                .ancestors()
+                .skip(1)
+                .filter_map(|dir| identity(dir, false))
+                .collect(),
+            path,
+            why,
+        }
+    }
+}
+
+/// Why `path`, keyed `key`, is or holds a [`Pinned`] file, if it does.
+fn pinned_by(path: &Path, key: &Path, pinned: &[Pinned]) -> Option<String> {
+    let id = identity(path, false);
+    pinned.iter().find_map(|file| {
+        if file.key == key || (id.is_some() && file.id == id) {
+            return Some(file.why.clone());
+        }
+        let holds = file.key.starts_with(key)
+            || id.is_some_and(|id| file.above.contains(&id));
+        holds.then(|| format!("it holds {}: {}", file.path.display(), file.why))
+    })
+}
+
+/// Read what [`Pinned`] covers: `/sys/block/loop*/loop/backing_file`,
+/// `/proc/swaps`, and the mount sources in `views` that are plain files.
+/// What cannot be read is left out; the other guards still apply.
+fn read_pinned(views: &[crate::space::MountView]) -> Vec<Pinned> {
+    let mut loops = Vec::new();
+    if let Ok(entries) = fs::read_dir("/sys/block") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("loop") {
+                continue;
+            }
+            if let Ok(file) =
+                fs::read_to_string(entry.path().join("loop/backing_file"))
+            {
+                loops.push((format!("/dev/{name}"), file));
+            }
+        }
+    }
+    let swaps = fs::read_to_string("/proc/swaps").unwrap_or_default();
+    pinned_files(&loops, &swaps, views, |path| {
+        fs::metadata(path).is_ok_and(|meta| meta.is_file())
+    })
+}
+
+/// [`read_pinned`] from what it read: each loop device with its backing
+/// file, the swap table, the mounts, and how to tell a plain file.
+fn pinned_files(
+    loops: &[(String, String)],
+    swaps: &str,
+    views: &[crate::space::MountView],
+    is_file: impl Fn(&Path) -> bool,
+) -> Vec<Pinned> {
+    let mut pinned = Vec::new();
+    for (device, file) in loops {
+        // The kernel ends the name with a newline, and marks a file
+        // removed since: nothing there to protect any more.
+        let file = file.strip_suffix('\n').unwrap_or(file);
+        if file.is_empty() || file.ends_with(" (deleted)") {
+            continue;
+        }
+        let at = views
+            .iter()
+            .find(|view| view.source == *device)
+            .map_or_else(String::new, |view| {
+                format!(" at {}", view.point.display())
+            });
+        pinned.push(Pinned::new(
+            PathBuf::from(file),
+            format!(
+                "the running system boots from or mounts this image \
+                 ({device}{at})"
+            ),
+        ));
+    }
+    // The header, then the file name and its type; spaces in the name are
+    // written as `\040`.
+    for line in swaps.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        if let (Some(file), Some("file")) = (fields.next(), fields.next()) {
+            pinned.push(Pinned::new(
+                PathBuf::from(crate::space::unescape_octal(file)),
+                "active swap: the running system pages to this file".into(),
+            ));
+        }
+    }
+    for view in views {
+        let source = Path::new(&view.source);
+        if source.is_absolute()
+            && !source.starts_with("/dev")
+            && is_file(source)
+        {
+            pinned.push(Pinned::new(
+                source.to_path_buf(),
+                format!(
+                    "the running system mounts this file at {}",
+                    view.point.display()
+                ),
+            ));
+        }
+    }
+    pinned
 }
 
 /// A real disk mounted whole under `/run`, and where else its folders are
@@ -699,8 +890,8 @@ fn read_mount_table() -> MountTable {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RunDisk {
     point: PathBuf,
-    /// Each other mount of the same filesystem outside `/run`: the folder
-    /// of the filesystem it shows, and where.
+    /// Each other mount of the same filesystem, `/run` included: the
+    /// folder of the filesystem it shows, and where.
     binds: Vec<(PathBuf, PathBuf)>,
 }
 
@@ -728,11 +919,12 @@ fn run_disks(mounts: &[crate::space::MountView]) -> Vec<RunDisk> {
         })
         .map(|disk| RunDisk {
             point: guard_key(&disk.point),
+            // A bind under `/run` counts too: the folder it shows must not
+            // be emptied, and what is seen through it is judged as `/run`.
             binds: mounts
                 .iter()
                 .filter(|other| {
-                    other.device == disk.device
-                        && !other.point.starts_with("/run")
+                    other.device == disk.device && other.point != disk.point
                 })
                 .map(|other| (other.fs_root.clone(), guard_key(&other.point)))
                 .collect(),
@@ -744,13 +936,14 @@ fn run_disks(mounts: &[crate::space::MountView]) -> Vec<RunDisk> {
 /// disk's own top, nor under a mount nested in it): `Ok` when it may go,
 /// judged where it is on that disk and at every bind that shows it.
 /// Refused when any of those is part of the system, holds part of it or
-/// the home directory, or is itself where a bind is mounted. `None` when
-/// the path is on no such disk.
+/// a home directory, holds a mount, or is itself where a bind is mounted.
+/// On `SparkOS` its boot images are refused too. `None` when the path is
+/// on no such disk.
 fn on_run_disk(
     key: &Path,
     mounts: &[PathBuf],
     disks: &[RunDisk],
-    home: Option<&Path>,
+    homes: &[PathBuf],
 ) -> Option<Result<(), String>> {
     // Nested mounts do not inherit their parent's exception.
     let point = mounts
@@ -761,6 +954,15 @@ fn on_run_disk(
     let inside = Path::new("/").join(key.strip_prefix(point).ok()?);
     if inside == Path::new("/") {
         return None;
+    }
+    // The running image is pinned on its own; the others there are the
+    // boot menu's fallbacks, and choosing between them is a shell job.
+    if disk.point == Path::new(crate::space::SPARKOS_DISK)
+        && inside.starts_with("/images")
+    {
+        return Some(Err("SparkOS boots from the images here, and keeps the \
+                         others as fallbacks: remove one from a shell"
+            .into()));
     }
     let mut views = vec![inside.clone()];
     for (shown, at) in &disk.binds {
@@ -782,7 +984,16 @@ fn on_run_disk(
         }
     }
     for view in &views {
-        if let Some(system) = system_tree(view, home) {
+        // A mount below a bind's spelling is below this path too: the
+        // removal would empty the folder and then fail on the mount.
+        if let Some(mount) = mount_below(view, mounts) {
+            return Some(Err(format!(
+                "{} is mounted inside it: removing it would reach into \
+                 another filesystem",
+                mount.display()
+            )));
+        }
+        if let Some(system) = system_tree(view, homes) {
             return Some(Err(format!(
                 "part of the system under {system} on this disk: \
                  {SYSTEM_TOOLS}"
@@ -794,7 +1005,7 @@ fn on_run_disk(
                  system"
             )));
         }
-        if home.is_some_and(|home| home.starts_with(view)) {
+        if homes.iter().any(|home| home.starts_with(view)) {
             return Some(Err("it contains the home directory".into()));
         }
     }
@@ -833,7 +1044,7 @@ fn media_roots(mounts: &[crate::space::MountView]) -> Vec<PathBuf> {
                 && !mounts.iter().any(|other| {
                     !other.point.starts_with("/run/media")
                         && (other.point == Path::new("/")
-                            || system_tree(&other.point, None).is_some())
+                            || system_tree(&other.point, &[]).is_some())
                         && (other.device == mount.device
                             || other.source == mount.source)
                 })
@@ -1374,7 +1585,7 @@ fn run(
     // Links too: one put on the way down since the plan was made would lead
     // the trash out of the root. Permanent removal on Unix refuses that by
     // itself; see [`open_parent`].
-    let home = std::env::home_dir().map(|home| Home::of(&home));
+    let homes = homes();
     let real_root = fs::canonicalize(&plan.root).ok();
 
     for target in &plan.targets {
@@ -1384,21 +1595,23 @@ fn run(
         // The /run exceptions, for media and for a disk mounted there,
         // must still hold when removal starts; a disk may have been
         // unmounted since the review was displayed.
+        // So must every file the system runs from: a swap file can be
+        // turned on, or an image attached, after the plan was made.
         let reason = target
             .path
             .starts_with("/run")
-            .then(|| {
-                refuse_with(&target.path, &plan.root, home.as_ref(), &mounts)
-            })
+            .then(|| refuse_with(&target.path, &plan.root, &homes, &mounts))
             .flatten()
+            .or_else(|| {
+                pinned_by(
+                    &target.path,
+                    &guard_key(&target.path),
+                    &mounts.pinned,
+                )
+            })
             .or_else(|| mounted(&target.path, &mounts.points))
             .or_else(|| {
-                linked(
-                    &target.path,
-                    &plan.root,
-                    real_root.as_deref(),
-                    home.as_ref(),
-                )
+                linked(&target.path, &plan.root, real_root.as_deref(), &homes)
             });
         let outcome = if let Some(reason) = reason {
             Err(io::Error::other(reason))
@@ -2045,7 +2258,7 @@ mod tests {
     /// [`system_tree`] for plain paths, keyed the way [`refuse`] keys them.
     #[cfg(not(windows))]
     fn tree_of(path: &Path, home: &Path) -> Option<&'static str> {
-        system_tree(&guard_key(path), Some(&guard_key(home)))
+        system_tree(&guard_key(path), &[guard_key(home)])
     }
 
     fn tree() -> TempDir {
@@ -2125,16 +2338,16 @@ mod tests {
         assert_eq!(disks[0].point, PathBuf::from("/run/sparkos/host"));
         let points: Vec<_> =
             views.iter().map(|view| guard_key(&view.point)).collect();
-        let home = Path::new("/home/me");
-        let judge = |path: &str| {
-            on_run_disk(Path::new(path), &points, &disks, Some(home))
-        };
+        let homes = [PathBuf::from("/home/me")];
+        let judge =
+            |path: &str| on_run_disk(Path::new(path), &points, &disks, &homes);
         for path in [
             "/run/sparkos/host/home/me/models",
             "/run/sparkos/host/home/other/cache",
             "/run/sparkos/host/srv/data",
             "/run/sparkos/host/var/log/old.log",
-            "/run/sparkos/host/images",
+            "/run/sparkos/host/var/cache/apt",
+            "/run/sparkos/host/var/tmp/build",
             "/run/sparkos/host/raid/scratch",
         ] {
             assert_eq!(judge(path), Some(Ok(())), "{path}");
@@ -2142,14 +2355,22 @@ mod tests {
         for path in [
             // System trees, through the disk and through a bind.
             "/run/sparkos/host/usr/lib",
+            "/run/sparkos/host/usr",
             "/run/sparkos/host/etc",
+            "/run/sparkos/host/boot",
+            "/run/sparkos/host/boot/sparkos",
             "/run/sparkos/host/var/lib/docker/volumes/v",
             "/run/sparkos/host/var",
             // Where a bind comes from, and what holds one.
             "/run/sparkos/host/home",
             "/run/sparkos/host/srv",
+            "/run/sparkos/host/root",
             // The home directory, by where it is on the disk.
             "/run/sparkos/host/home/me",
+            // What SparkOS boots from, and its fallbacks.
+            "/run/sparkos/host/images",
+            "/run/sparkos/host/images/spark-os-0.9.5-c.erofs",
+            "/run/sparkos/host/images/spark-os-0.9.5-b.erofs",
         ] {
             assert!(matches!(judge(path), Some(Err(_))), "{path}");
         }
@@ -2170,6 +2391,186 @@ mod tests {
             .is_empty(),
             "only a real disk, mounted whole"
         );
+    }
+
+    /// A mount under a bind's spelling of a folder holds that folder on
+    /// the disk too, and a bind of the disk under `/run` still shows what
+    /// it shows: both only refuse more.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mounts_below_a_bind_and_binds_under_run_hold_the_disk_folder() {
+        let views = crate::space::parse_mountinfo(
+            "33 39 0:29 / /run rw - tmpfs tmpfs rw\n\
+             34 33 259:2 / /run/sparkos/host rw - ext4 /dev/nvme0n1p2 rw\n\
+             39 2 0:31 / / rw - overlay overlay rw\n\
+             63 39 259:2 /srv /srv rw - ext4 /dev/nvme0n1p2 rw\n\
+             64 63 0:60 / /srv/data/nfs rw - nfs4 host:/x rw\n\
+             65 33 259:2 /raid/shared /run/shared rw - ext4 /dev/nvme0n1p2 \
+             rw\n",
+        );
+        let disks = run_disks(&views);
+        let points: Vec<_> =
+            views.iter().map(|view| guard_key(&view.point)).collect();
+        let homes = [PathBuf::from("/home/me"), PathBuf::from("/root")];
+        let judge =
+            |path: &str| on_run_disk(Path::new(path), &points, &disks, &homes);
+        let refused = |path: &str| match judge(path) {
+            Some(Err(reason)) => reason,
+            other => panic!("{path}: {other:?}"),
+        };
+        assert!(
+            refused("/run/sparkos/host/srv/data").contains("/srv/data/nfs"),
+            "a mount below the bind's spelling"
+        );
+        assert!(
+            refused("/run/sparkos/host/raid/shared").contains("/run/shared"),
+            "where a bind under /run comes from"
+        );
+        assert!(
+            refused("/run/sparkos/host/raid").contains("/run/shared"),
+            "what holds it"
+        );
+        refused("/run/sparkos/host/raid/shared/file");
+        assert_eq!(judge("/run/sparkos/host/srv/other"), Some(Ok(())));
+        assert_eq!(judge("/run/sparkos/host/raid/scratch"), Some(Ok(())));
+    }
+
+    /// A loop device's image, an active swap file and a file mounted
+    /// directly are refused, and so is every directory holding one, also
+    /// when reached through a link above it.
+    #[cfg(unix)]
+    #[test]
+    fn what_the_running_system_boots_from_or_swaps_to_is_refused() {
+        let temp = TempDir::new().expect("tempdir");
+        let disk = temp.path().join("disk");
+        fs::create_dir_all(disk.join("images")).expect("images");
+        fs::create_dir_all(disk.join("home/me/junk")).expect("home");
+        let image = disk.join("images/os.erofs");
+        let fallback = disk.join("images/old.erofs");
+        let swap = disk.join("swap file.img");
+        let mounted = disk.join("data.img");
+        for file in [&image, &fallback, &swap, &mounted] {
+            fs::write(file, b"x").expect("file");
+        }
+        std::os::unix::fs::symlink(&disk, temp.path().join("alias"))
+            .expect("alias");
+        std::os::unix::fs::symlink(&image, disk.join("home/me/link"))
+            .expect("link");
+        let views = crate::space::parse_mountinfo(&format!(
+            "35 33 7:0 / /run/sparkos/lower ro - erofs /dev/loop0 ro\n\
+             36 33 7:1 / /mnt/data ro - ext4 {} ro\n\
+             37 33 259:2 / /run/sparkos/host rw - ext4 /dev/nvme0n1p2 rw\n",
+            mounted.display()
+        ));
+        let swaps = format!(
+            "Filename\tType\tSize\tUsed\tPriority\n\
+             {} file 16 2 -1\n\
+             /dev/nvme0n1p3 partition 16 0 -2\n",
+            swap.display().to_string().replace(' ', "\\040")
+        );
+        let loops = [
+            ("/dev/loop0".to_owned(), format!("{}\n", image.display())),
+            ("/dev/loop1".to_owned(), "/gone.img (deleted)\n".to_owned()),
+            ("/dev/loop2".to_owned(), String::new()),
+        ];
+        let pinned = pinned_files(&loops, &swaps, &views, |path| {
+            fs::metadata(path).is_ok_and(|meta| meta.is_file())
+        });
+        let files: Vec<&Path> =
+            pinned.iter().map(|file| file.path.as_path()).collect();
+        assert_eq!(files, [image.as_path(), swap.as_path(), &mounted]);
+
+        let judge = |path: &Path| pinned_by(path, &guard_key(path), &pinned);
+        let image_why = judge(&image).expect("the image");
+        assert!(image_why.contains("boots from"), "{image_why}");
+        assert!(image_why.contains("/dev/loop0 at /run/sparkos/lower"));
+        assert!(judge(&swap).expect("swap").contains("active swap"));
+        assert!(judge(&mounted).expect("mounted").contains("/mnt/data"));
+        for holder in [
+            disk.join("images"),
+            disk.clone(),
+            temp.path().join("alias/images"),
+            temp.path().join("alias"),
+        ] {
+            if holder == temp.path().join("alias") {
+                // A link is only a link: removing it leaves the disk.
+                assert_eq!(judge(&holder), None);
+                continue;
+            }
+            let why = judge(&holder).expect("holds a pinned file");
+            assert!(why.starts_with("it holds "), "{holder:?}: {why}");
+        }
+        assert_eq!(judge(&fallback), None, "an image nothing reads");
+        assert_eq!(judge(&disk.join("home/me/junk")), None);
+        assert_eq!(judge(&disk.join("home/me/link")), None, "a link to it");
+
+        // The whole judgement refuses it before anything else could
+        // let it through.
+        let reason = refuse_judged(
+            &disk.join("images"),
+            temp.path(),
+            &[],
+            &[],
+            &[],
+            &[],
+            &pinned,
+        );
+        assert!(reason.is_some_and(|reason| reason.contains("os.erofs")));
+        assert_eq!(
+            refuse_judged(
+                &disk.join("home/me/junk"),
+                temp.path(),
+                &[],
+                &[],
+                &[],
+                &[],
+                &pinned,
+            ),
+            None
+        );
+    }
+
+    /// Under `sudo` with the caller's `HOME`, root's home is protected as
+    /// well as the caller's: both, not one or the other.
+    #[test]
+    fn both_homes_are_protected_under_sudo() {
+        let passwd = "root:x:0:0:root:/root:/bin/bash\n\
+                      me:x:1000:1000::/home/me:/bin/zsh\n\
+                      nobody:x:65534:65534::/:/usr/sbin/nologin\n\
+                      broken line\n";
+        assert_eq!(passwd_home(passwd, 0), Some(PathBuf::from("/root")));
+        assert_eq!(passwd_home(passwd, 1000), Some(PathBuf::from("/home/me")));
+        assert_eq!(passwd_home(passwd, 65534), None, "a home of /");
+        assert_eq!(passwd_home(passwd, 7), None);
+
+        let homes = [
+            Home::of(Path::new("/home/disktree-test-user")),
+            Home::of(Path::new("/disktree-test-root")),
+        ];
+        let judge = |path: &str| {
+            refuse_judged(
+                Path::new(path),
+                Path::new("/"),
+                &homes,
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+        };
+        assert_eq!(
+            judge("/disktree-test-root").as_deref(),
+            Some("the home directory cannot be removed")
+        );
+        assert_eq!(
+            judge("/home/disktree-test-user").as_deref(),
+            Some("the home directory cannot be removed")
+        );
+        assert_eq!(
+            judge("/home").as_deref(),
+            Some("it contains the home directory")
+        );
+        assert_eq!(judge("/disktree-test-root/.cache"), None);
     }
 
     /// Run in a private mount namespace with the fixture described in
@@ -2299,6 +2700,7 @@ mod tests {
             run_disks: Vec::new(),
             mounts: Some(crate::space::parse_mounts(table)),
             views: Vec::new(),
+            pinned: Vec::new(),
         };
         let marked = [
             target(Path::new("/home/tobi/junk"), 100),
@@ -2768,12 +3170,21 @@ mod tests {
         let home = Home::of(&spelled.path().join("home/user"));
         let root = fs::canonicalize(temp.path()).expect("real root");
 
-        let reason =
-            linked(&root.join("data"), &root, Some(&root), Some(&home))
-                .expect("refused");
+        let reason = linked(
+            &root.join("data"),
+            &root,
+            Some(&root),
+            std::slice::from_ref(&home),
+        )
+        .expect("refused");
         assert!(reason.contains("home directory"), "{reason}");
         assert_eq!(
-            linked(&root.join("other"), &root, Some(&root), Some(&home)),
+            linked(
+                &root.join("other"),
+                &root,
+                Some(&root),
+                std::slice::from_ref(&home)
+            ),
             None
         );
     }
@@ -3207,11 +3618,8 @@ mod tests {
         let drive = system_drive();
         let home = drive.join(r"Users\tobi");
         let system = |relative: &str| {
-            system_tree(
-                &guard_key(&drive.join(relative)),
-                Some(&guard_key(&home)),
-            )
-            .map(str::to_lowercase)
+            system_tree(&guard_key(&drive.join(relative)), &[guard_key(&home)])
+                .map(str::to_lowercase)
         };
         let windows = drive.join("Windows").display().to_string();
         assert!(
