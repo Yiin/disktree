@@ -32,6 +32,10 @@ const COUNTS: u8 = 1 << 4;
 const CHILDREN: u8 = 1 << 5;
 const SECTORS: u8 = 1 << 6;
 
+/// The fewest bytes a node takes: flags, class, an empty name, a size and
+/// a time of one byte each.
+const MIN_NODE: usize = 5;
+
 /// Raw bytes per chunk before compression. Large enough that zstd finds
 /// the repeats in names, small enough that the first chunk is on its way
 /// while the encoder is still walking.
@@ -116,6 +120,11 @@ pub struct TreeBuilder {
     open: Vec<(Node, usize)>,
     root: Option<Node>,
     nodes: u64,
+    /// Children that may still be reserved before they arrive: one per
+    /// [`MIN_NODE`] bytes fed, less what was reserved. A child count is
+    /// not proven until its children come, and nested counts would
+    /// otherwise each reserve against the same bytes.
+    unproven: usize,
 }
 
 impl TreeBuilder {
@@ -131,13 +140,15 @@ impl TreeBuilder {
     /// Decode every node in `chunk`.
     pub fn feed(&mut self, chunk: &[u8]) -> io::Result<()> {
         let mut input = Decoder::new(chunk);
+        self.unproven = self.unproven.saturating_add(chunk.len() / MIN_NODE);
         while !input.is_empty() {
             if self.root.is_some() {
                 return Err(invalid("nodes after the root was complete"));
             }
             let parent_modified =
                 self.open.last().map_or(0, |(parent, _)| parent.modified);
-            let (node, children) = decode_node(&mut input, parent_modified)?;
+            let (node, children) =
+                decode_node(&mut input, parent_modified, &mut self.unproven)?;
             self.nodes += 1;
             if children > 0 {
                 self.open.push((node, children));
@@ -175,9 +186,12 @@ impl TreeBuilder {
     }
 }
 
+/// One node, reserving room for its children out of `unproven`; see
+/// [`TreeBuilder::unproven`].
 fn decode_node(
     input: &mut Decoder<'_>,
     parent_modified: i64,
+    unproven: &mut usize,
 ) -> io::Result<(Node, usize)> {
     let flags = input.u8()?;
     let class = input.u8()?;
@@ -212,8 +226,11 @@ fn decode_node(
         if count == 0 {
             return Err(invalid("a child count of zero behind its flag"));
         }
-        // Capped: the count is not proven until the children arrive.
-        node.children.reserve(count.min(1 << 16));
+        // Capped: the count is not proven until the children arrive, so
+        // what all counts reserve together stays within the bytes fed.
+        let reserve = count.min(1 << 16).min(*unproven);
+        node.children.reserve(reserve);
+        *unproven -= reserve;
         count
     };
     Ok((node, children))
@@ -332,6 +349,37 @@ pub fn same_tree(left: &Node, right: &Node) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nodes that each claim the most children the decoder reserves for,
+    /// nested in one another: what the counts reserve together stays
+    /// within the bytes that arrived, not counts times depth.
+    #[test]
+    fn absurd_child_counts_reserve_no_more_than_the_input_holds() {
+        let mut out = Encoder::new();
+        for _ in 0..20_000 {
+            out.u8(CHILDREN);
+            out.u8(0);
+            out.str("");
+            out.uint(0);
+            out.int(0);
+            out.usize(usize::MAX >> 1);
+        }
+        let mut builder = TreeBuilder::new();
+        builder
+            .feed(&out.buf)
+            .expect("well formed, if never finished");
+        let reserved: usize = builder
+            .open
+            .iter()
+            .map(|(node, _)| node.children.capacity())
+            .sum();
+        assert!(
+            reserved <= out.buf.len() / MIN_NODE,
+            "{reserved} children reserved for {} bytes",
+            out.buf.len()
+        );
+        assert!(builder.finish().is_err(), "the children never came");
+    }
 
     fn round_trip(root: &Node, chunk: usize) -> (Node, usize) {
         let mut chunks = Vec::new();

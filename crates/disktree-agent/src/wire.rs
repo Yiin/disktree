@@ -258,13 +258,20 @@ pub fn read_frame(input: &mut impl Read) -> io::Result<Option<(u8, Vec<u8>)>> {
         return Ok(None);
     }
     let mut len = 0_usize;
+    let mut ended = false;
     for shift in (0..64).step_by(7) {
         let mut byte = [0_u8];
         input.read_exact(&mut byte)?;
         len |= usize::from(byte[0] & 0x7F) << shift;
         if byte[0] & 0x80 == 0 {
+            ended = true;
             break;
         }
+    }
+    // Ten bytes that all go on would leave a length cut short, and the
+    // stream read out of step from there.
+    if !ended {
+        return Err(invalid("a frame length longer than 64 bits"));
     }
     if len > MAX_FRAME {
         return Err(invalid(format!(
@@ -336,6 +343,18 @@ mod tests {
         assert_eq!(read_frame(&mut input).unwrap(), Some((7, b"hello".into())));
         assert_eq!(read_frame(&mut input).unwrap(), Some((8, Vec::new())));
         assert_eq!(read_frame(&mut input).unwrap(), None);
+    }
+
+    #[test]
+    fn an_overlong_frame_length_is_refused_not_read_out_of_step() {
+        // Ten continuation bytes would read as a length of zero, and the
+        // frame after as the next one.
+        let mut stream = vec![1];
+        stream.extend_from_slice(&[0x80; 10]);
+        write_frame(&mut stream, 7, b"hello").unwrap();
+        let error = read_frame(&mut stream.as_slice()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("longer than 64 bits"), "{error}");
     }
 
     #[test]
