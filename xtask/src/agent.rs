@@ -9,8 +9,16 @@
 //!   says so instead of a page of linker errors;
 //! * zig, as the C compiler for mimalloc (see the agent's manifest): it
 //!   carries musl's headers for every architecture, which no other
-//!   compiler on a desktop does. `ZIG` names it when it is not on `PATH`.
+//!   compiler on a desktop does.
+//!
+//! Both are found without a long `PATH` line: rustup in `RUSTUP_HOME` and
+//! `CARGO_HOME`, by default `~/.local/share/rustup` and
+//! `~/.local/share/cargo`, where a user-level install keeps it beside a
+//! distribution's Rust; zig in `ZIG`, then on `PATH`, then the newest
+//! `~/.local/share/zig/*/zig`. Without a rustup there, the cargo and rustc
+//! running this are used.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -35,15 +43,16 @@ const TARGETS: [(&str, &str, u16, &str); 2] = [
 const OUT: &str = "target/agent";
 
 pub fn agent(cargo: &str) -> Result<(), String> {
+    let toolchain = Toolchain::find(cargo);
     for (triple, ..) in TARGETS {
-        has_std(triple)?;
+        has_std(&toolchain, triple)?;
     }
     let zig = zig()?;
     fs::create_dir_all(OUT)
         .map_err(|err| format!("could not create {OUT}: {err}"))?;
     for (triple, arch, machine, zig_target) in TARGETS {
         let compiler = zig_wrappers(&zig, triple, zig_target)?;
-        build(cargo, triple, &compiler)?;
+        build(&toolchain, triple, &compiler)?;
         let built: PathBuf = ["target", triple, "release", "disktree-agent"]
             .iter()
             .collect();
@@ -64,9 +73,71 @@ pub fn agent(cargo: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether the toolchain running this has `triple`'s standard library.
-fn has_std(triple: &str) -> Result<(), String> {
-    let output = Command::new("rustc")
+/// The cargo and rustc that build the agents, and what they need in their
+/// environment.
+struct Toolchain {
+    cargo: PathBuf,
+    rustc: PathBuf,
+    /// rustup's variables and its `bin` first on `PATH`, so whatever cargo
+    /// runs is rustup's too; empty for the toolchain running this.
+    env: Vec<(&'static str, OsString)>,
+}
+
+impl Toolchain {
+    /// rustup's when `CARGO_HOME` (default `~/.local/share/cargo`) has its
+    /// cargo and `RUSTUP_HOME` (default `~/.local/share/rustup`) is there,
+    /// else `running`, the cargo running this, and `rustc` from `PATH`.
+    fn find(running: &str) -> Self {
+        let data = std::env::home_dir().map(|home| home.join(".local/share"));
+        let dir = |var: &str, name: &str| {
+            std::env::var_os(var)
+                .map(PathBuf::from)
+                .or_else(|| data.as_ref().map(|data| data.join(name)))
+        };
+        let fallback = Self {
+            cargo: PathBuf::from(running),
+            rustc: PathBuf::from("rustc"),
+            env: Vec::new(),
+        };
+        let (Some(cargo_home), Some(rustup_home)) =
+            (dir("CARGO_HOME", "cargo"), dir("RUSTUP_HOME", "rustup"))
+        else {
+            return fallback;
+        };
+        let bin = cargo_home.join("bin");
+        let exe = |name: &str| {
+            bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+        };
+        if !exe("cargo").is_file() || !rustup_home.is_dir() {
+            return fallback;
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(bin.clone()).chain(std::env::split_paths(&path)),
+        )
+        .unwrap_or(path);
+        Self {
+            cargo: exe("cargo"),
+            rustc: exe("rustc"),
+            env: vec![
+                ("CARGO_HOME", cargo_home.into_os_string()),
+                ("RUSTUP_HOME", rustup_home.into_os_string()),
+                ("PATH", path),
+            ],
+        }
+    }
+
+    fn command(&self, program: &Path) -> Command {
+        let mut command = Command::new(program);
+        command.envs(self.env.iter().map(|(key, value)| (key, value)));
+        command
+    }
+}
+
+/// Whether the toolchain has `triple`'s standard library.
+fn has_std(toolchain: &Toolchain, triple: &str) -> Result<(), String> {
+    let output = toolchain
+        .command(&toolchain.rustc)
         .args(["--print", "target-libdir", "--target", triple])
         .stderr(Stdio::null())
         .output()
@@ -83,29 +154,53 @@ fn has_std(triple: &str) -> Result<(), String> {
     } else {
         Err(format!(
             "this toolchain has no standard library for {triple}. With \
-             rustup: `rustup target add {triple}`, then run `cargo xtask \
-             agent` with rustup's cargo first on PATH"
+             rustup: `rustup target add {triple}`; a rustup outside \
+             ~/.local/share is named by RUSTUP_HOME and CARGO_HOME"
         ))
     }
 }
 
-/// zig, from `ZIG` or `PATH`, if it runs.
+/// zig, from `ZIG`, `PATH` or `~/.local/share/zig`, if it runs.
 fn zig() -> Result<String, String> {
-    let zig = std::env::var("ZIG").unwrap_or_else(|_| "zig".into());
-    let runs = Command::new(&zig)
-        .arg("version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if runs {
-        Ok(zig)
-    } else {
-        Err(format!(
-            "could not run `{zig} version`: the musl agents need zig \
-             (ziglang.org) to compile mimalloc; put it on PATH or set ZIG"
-        ))
+    let runs = |zig: &str| {
+        Command::new(zig)
+            .arg("version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    if let Ok(zig) = std::env::var("ZIG") {
+        return if runs(&zig) {
+            Ok(zig)
+        } else {
+            Err(format!("could not run `{zig} version` (from ZIG)"))
+        };
     }
+    if runs("zig") {
+        return Ok("zig".into());
+    }
+    // An unpacked release is a folder named for its version; the last in
+    // name order is the newest of one version scheme.
+    let unpacked = std::env::home_dir()
+        .map(|home| home.join(".local/share/zig"))
+        .and_then(|dir| fs::read_dir(dir).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path().join("zig"))
+        .filter(|zig| zig.is_file())
+        .max();
+    if let Some(zig) = unpacked.map(|zig| zig.to_string_lossy().into_owned())
+        && runs(&zig)
+    {
+        return Ok(zig);
+    }
+    Err(
+        "the musl agents need zig (ziglang.org) to compile mimalloc: put \
+         it on PATH, unpack it under ~/.local/share/zig, or set ZIG"
+            .into(),
+    )
 }
 
 /// The C compiler and archiver the `cc` crate will run for `triple`.
@@ -168,10 +263,16 @@ fn zig_wrappers(_: &str, _: &str, _: &str) -> Result<Compiler, String> {
     Err("build the agents on Linux or macOS".into())
 }
 
-fn build(cargo: &str, triple: &str, compiler: &Compiler) -> Result<(), String> {
+fn build(
+    toolchain: &Toolchain,
+    triple: &str,
+    compiler: &Compiler,
+) -> Result<(), String> {
     let target = triple.replace('-', "_");
     let linker = format!("CARGO_TARGET_{}_LINKER", target.to_uppercase());
-    let status = Command::new(cargo)
+    let cargo = toolchain.cargo.display();
+    let status = toolchain
+        .command(&toolchain.cargo)
         .args([
             "build",
             "--release",

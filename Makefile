@@ -26,13 +26,14 @@ TARGET = target/release/disktree
 ICON = assets/disktree.svg
 DESKTOP = packaging/disktree.desktop.in
 
-.PHONY: help build run install uninstall bundle lint test ci fmt clean
+.PHONY: help build run agent install uninstall bundle lint test ci fmt clean
 
 help:
 	@echo "disktree"
 	@echo
 	@echo "  make build       release build"
 	@echo "  make run         build and run, scanning $$HOME"
+	@echo "  make agent       static Linux agents for remote hosts, in target/agent"
 	@echo "  make install     install to $(PREFIX): binary, desktop entry, icon"
 	@echo "                   (macOS: disktree.app into $(APPS))"
 	@echo "  make bundle      macOS: build target/bundle/disktree.app and its zip"
@@ -51,6 +52,11 @@ build:
 
 run: build
 	$(TARGET)
+
+# The agents `disktree HOST` installs on another machine. The app embeds
+# whatever is in target/agent when it is built, so this comes first.
+agent:
+	$(CARGO) xtask agent
 
 lint:
 	$(CARGO) xtask lint
@@ -84,7 +90,10 @@ uninstall:
 	@if [ -L "$(BINDIR)/disktree" ]; then rm -f "$(BINDIR)/disktree"; fi
 	@echo "removed"
 else
-install: build
+# Agents first: the build embeds them, and a disktree without them cannot
+# scan another machine.
+install: agent
+	$(MAKE) build
 	install -d $(BINDIR) $(APPDIR) $(ICONDIR)
 	install -m755 $(TARGET) $(BINDIR)/disktree
 	install -m644 $(ICON) $(ICONDIR)/disktree.svg

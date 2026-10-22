@@ -1,6 +1,41 @@
+//! The Windows icon, and the remote agents `cargo xtask agent` built.
+
+use std::path::{Path, PathBuf};
+
+/// The architectures `cargo xtask agent` builds, as `uname -m` names them.
+const AGENTS: [&str; 2] = ["aarch64", "x86_64"];
+
+/// Embed each agent in `target/agent` that is there, and say which through
+/// `cfg(agent_<arch>)` and `DISKTREE_AGENT_<ARCH>`. Without any the app
+/// still builds; connecting to another machine then says to build them.
+fn embed_agents() {
+    let manifest =
+        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let dir = manifest.join("../../target/agent");
+    // Watched as a directory, which cargo scans for changes: a path that
+    // does not exist would rerun this script, and rebuild the app, on every
+    // build. So the folder is made if it is missing.
+    let _ = std::fs::create_dir_all(&dir);
+    println!("cargo:rerun-if-changed={}", dir.display());
+    for arch in AGENTS {
+        println!("cargo:rustc-check-cfg=cfg(agent_{arch})");
+        let agent: &Path = &dir.join(format!("disktree-agent-{arch}"));
+        if agent.is_file() {
+            println!("cargo:rustc-cfg=agent_{arch}");
+            println!(
+                "cargo:rustc-env=DISKTREE_AGENT_{}={}",
+                arch.to_uppercase(),
+                agent.display()
+            );
+        }
+    }
+}
+
 #[cfg(windows)]
 fn main() {
-    use std::{env, fs, path::PathBuf, process::Command};
+    use std::{env, fs, process::Command};
+
+    embed_agents();
 
     let icon = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
         .join("../../assets/disktree.ico")
@@ -62,4 +97,6 @@ fn main() {
 }
 
 #[cfg(not(windows))]
-fn main() {}
+fn main() {
+    embed_agents();
+}
