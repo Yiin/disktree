@@ -244,7 +244,8 @@ impl Agent {
             }
             Request::Plan { root, targets }
             | Request::Remove { root, targets, .. }
-                if let Some(reason) = unanchored(&root, &targets) =>
+                if let Some(reason) = unanchored(&root, &targets)
+                    .or_else(|| resolved_elsewhere(&root)) =>
             {
                 self.send(
                     id,
@@ -461,6 +462,34 @@ fn unanchored(root: &Path, targets: &[Target]) -> Option<String> {
     })
 }
 
+/// Why a plan or a removal is refused when its root is not its own real
+/// path: through a link there, every spelling below it names somewhere
+/// else, `/etc` among them when the link leads to `/`, and the link check
+/// takes a root as meant. The app resolves every root it sends; the agent
+/// does not count on that. A bind of `/` keeps its spelling, and the
+/// guards judge system trees by device and inode for that.
+///
+/// Unix only, where the agent runs: Windows spells a resolved path with
+/// `\\?\`, which no root the app sends there has.
+fn resolved_elsewhere(root: &Path) -> Option<String> {
+    if !cfg!(unix) {
+        return None;
+    }
+    match std::fs::canonicalize(root) {
+        Ok(real) if real == root => None,
+        Ok(real) => Some(format!(
+            "the scanned root {} is really {}: nothing was judged or removed",
+            root.display(),
+            real.display()
+        )),
+        Err(error) => Some(format!(
+            "the scanned root {} cannot be resolved ({error}): nothing was \
+             judged or removed",
+            root.display()
+        )),
+    }
+}
+
 fn space_report(path: &Path) -> SpaceReport {
     SpaceReport {
         space: space::space_info(path).map_err(|error| error.to_string()),
@@ -545,6 +574,35 @@ mod tests {
             .collect()
     }
 
+    /// The temporary folder's real path: the agent judges only a root
+    /// that is its own, and macOS keeps temporary files behind a link.
+    fn real(temp: &tempfile::TempDir) -> PathBuf {
+        std::fs::canonicalize(temp.path()).unwrap()
+    }
+
+    /// The first `count` replies the agent wrote after its hello.
+    fn replies(output: &Captured, count: usize) -> Vec<(u64, Reply)> {
+        let started = std::time::Instant::now();
+        loop {
+            let written = lock(&output.0).clone();
+            let mut stream = written.as_slice();
+            read_preamble(&mut stream).unwrap();
+            let replies: Vec<(u64, Reply)> =
+                std::iter::from_fn(|| read_frame(&mut stream).ok().flatten())
+                    .skip(1)
+                    .map(|(tag, payload)| {
+                        let (id, reply) = Reply::decode(tag, &payload).unwrap();
+                        (id, reply.unwrap())
+                    })
+                    .collect();
+            if replies.len() >= count {
+                return replies;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "no reply");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn remaining(targets: &[Target]) -> usize {
         targets.iter().filter(|target| target.path.exists()).count()
     }
@@ -563,7 +621,7 @@ mod tests {
     #[test]
     fn a_removal_never_starts_for_a_client_it_cannot_write_to() {
         let temp = tempfile::tempdir().unwrap();
-        let targets = directories(temp.path(), 20, 1);
+        let targets = directories(&real(&temp), 20, 1);
         let (reader, mut writer) = io::pipe().unwrap();
         let output = Breakable::default();
         let serving = thread::spawn({
@@ -575,7 +633,7 @@ mod tests {
         }
         output.broken.store(true, Ordering::Relaxed);
         writer
-            .write_all(&remove_frame(temp.path(), &targets))
+            .write_all(&remove_frame(&real(&temp), &targets))
             .unwrap();
         // The answer fails to send; give the request time to reach it.
         thread::sleep(Duration::from_millis(300));
@@ -590,11 +648,11 @@ mod tests {
     #[test]
     fn a_removal_stops_when_its_client_goes() {
         let temp = tempfile::tempdir().unwrap();
-        let targets = directories(temp.path(), 200, 200);
+        let targets = directories(&real(&temp), 200, 200);
         let (reader, mut writer) = io::pipe().unwrap();
         let serving = thread::spawn(move || serve(reader, Captured::default()));
         writer
-            .write_all(&remove_frame(temp.path(), &targets))
+            .write_all(&remove_frame(&real(&temp), &targets))
             .unwrap();
         let started = std::time::Instant::now();
         while remaining(&targets) == targets.len() {
@@ -624,14 +682,14 @@ mod tests {
     #[test]
     fn a_removal_stops_when_its_client_falls_silent() {
         let temp = tempfile::tempdir().unwrap();
-        let targets = directories(temp.path(), 200, 200);
+        let targets = directories(&real(&temp), 200, 200);
         let (reader, mut writer) = io::pipe().unwrap();
         let silence = Duration::from_millis(200);
         let serving = thread::spawn(move || {
             serve_until_silent(reader, Captured::default(), silence)
         });
         writer
-            .write_all(&remove_frame(temp.path(), &targets))
+            .write_all(&remove_frame(&real(&temp), &targets))
             .unwrap();
         let started = std::time::Instant::now();
         let error = serving.join().unwrap().unwrap_err();
@@ -710,6 +768,72 @@ mod tests {
         }
         drop(writer);
         serving.join().unwrap().unwrap();
+    }
+
+    /// A root that is a link is refused before anything is judged: one
+    /// to `/` would show `/etc` inside the root, and one to a folder of
+    /// this tree would show its files under another name.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_resolves_elsewhere_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = real(&temp);
+        let to_slash = base.join("r");
+        std::os::unix::fs::symlink("/", &to_slash).unwrap();
+        let disk = base.join("disk");
+        std::fs::create_dir(&disk).unwrap();
+        let targets = directories(&disk, 2, 1);
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&disk, &alias).unwrap();
+        let through = |target: &Target| Target {
+            path: alias.join(target.path.file_name().unwrap()),
+            ..target.clone()
+        };
+        let etc = Target {
+            path: to_slash.join("etc"),
+            bytes: 1,
+            is_dir: true,
+            hidden: false,
+        };
+        let mut input = frame(
+            &Request::Plan {
+                root: to_slash.clone(),
+                targets: vec![etc],
+            },
+            1,
+        );
+        input.extend(frame(
+            &Request::Remove {
+                root: alias.clone(),
+                targets: targets.iter().map(through).collect(),
+                mode: RemovalMode::Permanent,
+            },
+            2,
+        ));
+        input.extend(frame(
+            &Request::Plan {
+                root: base.join("missing"),
+                targets: Vec::new(),
+            },
+            3,
+        ));
+        let output = Captured::default();
+        serve(io::Cursor::new(input), output.clone()).unwrap();
+
+        let mut answered = replies(&output, 3);
+        answered.sort_by_key(|(id, _)| *id);
+        for ((id, reply), said) in answered.iter().zip([
+            format!("{} is really /", to_slash.display()),
+            format!("{} is really {}", alias.display(), disk.display()),
+            "cannot be resolved".to_owned(),
+        ]) {
+            let Reply::Failed { kind, message } = reply else {
+                panic!("{id}: {reply:?}");
+            };
+            assert_eq!(*kind, io::ErrorKind::InvalidInput, "{id}");
+            assert!(message.contains(&said), "{id}: {message}");
+        }
+        assert_eq!(remaining(&targets), targets.len(), "nothing removed");
     }
 
     #[test]

@@ -170,7 +170,8 @@ fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
     for target in targets {
         let path = normalize(&target.path);
         let reason = refuse_with(&path, &root, &homes, mounts)
-            .or_else(|| linked(&path, &root, real_root.as_deref(), &homes));
+            .or_else(|| linked(&path, &root, real_root.as_deref(), &homes))
+            .or_else(|| aliased(&path, &homes, &mounts.trees));
         if let Some(reason) = reason {
             plan.blocked.push(Blocked {
                 path: target.path.clone(),
@@ -417,13 +418,18 @@ struct Home {
     /// Device and inode (volume and file id on Windows), so a spelling
     /// [`guard_key`] cannot fold still matches.
     id: Option<(u64, u64)>,
+    /// Device and inode of each directory above it, by its real path: a
+    /// bind of `/` holds the home directory under another name.
+    above: Vec<(u64, u64)>,
 }
 
 impl Home {
     fn of(path: &Path) -> Self {
+        let real = fs::canonicalize(path).ok();
         Self {
             key: guard_key(path),
-            real: fs::canonicalize(path).ok().map(|real| guard_key(&real)),
+            above: real.as_deref().map(ids_above).unwrap_or_default(),
+            real: real.map(|real| guard_key(&real)),
             id: identity(path, true),
         }
     }
@@ -673,6 +679,100 @@ fn linked(
     None
 }
 
+/// A system tree by what it is rather than how it is spelled: a link or
+/// a bind of `/` shows `/etc` under any name, and the guards that compare
+/// spellings pass it. Read where the platform has cheap identities.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SystemTreeId {
+    /// The tree as [`SYSTEM_TREES`] names it, said when it is refused.
+    name: String,
+    key: PathBuf,
+    id: (u64, u64),
+    /// Device and inode of each directory above it, by its real path.
+    above: Vec<(u64, u64)>,
+}
+
+impl SystemTreeId {
+    /// `name`, spelled as the guards know it, found at `real`.
+    fn at(name: &str, real: &Path) -> Option<Self> {
+        Some(Self {
+            name: name.to_owned(),
+            key: guard_key(Path::new(name)),
+            id: identity(real, false)?,
+            above: ids_above(real),
+        })
+    }
+}
+
+/// The system trees this machine has, by identity. Only on Unix, where
+/// a `stat` is cheap: the review screen plans on every frame, and a
+/// Windows identity opens a handle.
+fn read_tree_ids() -> Vec<SystemTreeId> {
+    if !cfg!(unix) {
+        return Vec::new();
+    }
+    system_tree_keys()
+        .iter()
+        .filter_map(|(name, _)| {
+            SystemTreeId::at(name, &fs::canonicalize(name).ok()?)
+        })
+        .collect()
+}
+
+/// Device and inode of each directory above `real`, a resolved path.
+fn ids_above(real: &Path) -> Vec<(u64, u64)> {
+    real.ancestors()
+        .skip(1)
+        .filter_map(|dir| identity(dir, false))
+        .collect()
+}
+
+/// Why `path` is a system tree, is inside one, holds one or holds the
+/// home directory by device and inode, where its spelling says it is
+/// somewhere else. Walked up from `path`: inside a home directory, met
+/// on the way, nothing is system, as by spelling; and a tree met under
+/// its own spelling was judged by spelling already, with its exceptions.
+fn aliased(
+    path: &Path,
+    homes: &[Home],
+    trees: &[SystemTreeId],
+) -> Option<String> {
+    // Not followed: a link is removed, never what it leads to.
+    let own = identity(path, false)?;
+    if let Some(tree) = trees.iter().find(|tree| tree.above.contains(&own)) {
+        return Some(format!(
+            "it holds {}, which is part of the system",
+            tree.name
+        ));
+    }
+    if homes.iter().any(|home| home.above.contains(&own)) {
+        return Some("it contains the home directory".into());
+    }
+    let above = path
+        .ancestors()
+        .skip(1)
+        .map(|dir| (dir, identity(dir, true)));
+    for (dir, id) in std::iter::once((path, Some(own))).chain(above) {
+        let Some(id) = id else {
+            continue;
+        };
+        if homes.iter().any(|home| home.id == Some(id)) {
+            return None;
+        }
+        if let Some(tree) = trees.iter().find(|tree| tree.id == id) {
+            if guard_key(dir) == tree.key {
+                return None;
+            }
+            return Some(format!(
+                "{} is {}: part of the system, {SYSTEM_TOOLS}",
+                dir.display(),
+                tree.name
+            ));
+        }
+    }
+    None
+}
+
 /// `(device, inode)`: what makes two spellings one directory entry.
 /// `follow` decides whether a symlink at `path` answers for itself or for
 /// what it points to.
@@ -722,6 +822,8 @@ struct MountTable {
     /// Files the running system uses as storage; see [`Pinned`]. Empty
     /// off Linux.
     pinned: Vec<Pinned>,
+    /// The system trees by identity; see [`aliased`]. Empty off Unix.
+    trees: Vec<SystemTreeId>,
 }
 
 fn read_mount_table() -> MountTable {
@@ -736,6 +838,7 @@ fn read_mount_table() -> MountTable {
             run_disks: run_disks(&views),
             mounts,
             pinned: read_pinned(&views),
+            trees: read_tree_ids(),
             views,
         };
     }
@@ -746,6 +849,7 @@ fn read_mount_table() -> MountTable {
         mounts,
         views: Vec::new(),
         pinned: Vec::new(),
+        trees: read_tree_ids(),
     }
 }
 
@@ -775,11 +879,7 @@ impl Pinned {
         Self {
             key: guard_key(&path),
             id: identity(&real, false),
-            above: real
-                .ancestors()
-                .skip(1)
-                .filter_map(|dir| identity(dir, false))
-                .collect(),
+            above: ids_above(&real),
             path,
             why,
         }
@@ -1627,7 +1727,8 @@ fn run(
             .or_else(|| mounted(&target.path, &mounts.points))
             .or_else(|| {
                 linked(&target.path, &plan.root, real_root.as_deref(), &homes)
-            });
+            })
+            .or_else(|| aliased(&target.path, &homes, &mounts.trees));
         let outcome = if let Some(reason) = reason {
             Err(io::Error::other(reason))
         } else {
@@ -2468,6 +2569,67 @@ mod tests {
         assert_eq!(judge("/run/sparkos/host/raid/scratch"), Some(Ok(())));
     }
 
+    /// A system tree reached under another name, as through a link or a
+    /// bind of `/`, is judged by device and inode: what is inside it,
+    /// what holds it, and what holds the home directory are refused; what
+    /// is inside a home, or met under the tree's own spelling, is left to
+    /// the spelling's judgement.
+    #[cfg(unix)]
+    #[test]
+    fn a_system_tree_under_another_name_is_refused() {
+        let temp = TempDir::new().expect("tempdir");
+        let base = fs::canonicalize(temp.path()).expect("real");
+        // Stands for `/`, with its `/etc` and a home.
+        let top = base.join("top");
+        for dir in ["etc/ssh", "home/me/junk", "srv/data"] {
+            fs::create_dir_all(top.join(dir)).expect("tree");
+        }
+        let etc = top.join("etc");
+        let trees = [
+            SystemTreeId::at(&etc.display().to_string(), &etc).expect("etc")
+        ];
+        let homes = [Home::of(&top.join("home/me"))];
+        // The scanned folder holds a link to the whole of it, and one to
+        // the folder above it.
+        let scan = base.join("scan");
+        fs::create_dir(&scan).expect("scan");
+        std::os::unix::fs::symlink(&top, scan.join("rootbind")).expect("link");
+        std::os::unix::fs::symlink(&base, scan.join("up")).expect("link");
+        let judge = |path: PathBuf| aliased(&path, &homes, &trees);
+
+        for inside in ["rootbind/etc", "rootbind/etc/ssh"] {
+            let why = judge(scan.join(inside)).expect(inside);
+            assert!(why.contains("part of the system"), "{inside}: {why}");
+        }
+        let why = judge(scan.join("up/top")).expect("holds etc");
+        assert!(why.starts_with("it holds "), "{why}");
+        let why = judge(scan.join("rootbind/home")).expect("holds home");
+        assert_eq!(why, "it contains the home directory");
+        assert_eq!(judge(scan.join("rootbind/srv/data")), None);
+        assert_eq!(judge(scan.join("rootbind/home/me/junk")), None);
+        assert_eq!(judge(etc.join("ssh")), None, "judged by its spelling");
+        assert_eq!(judge(scan.join("rootbind")), None, "a link is a link");
+        assert_eq!(judge(scan.join("missing")), None);
+    }
+
+    /// A scanned root that is a link to `/`: every spelling below it is
+    /// one the link check takes as meant, and `/etc` is still refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_real_etc_through_a_root_that_links_to_it_is_refused() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("r");
+        std::os::unix::fs::symlink("/", &root).expect("link");
+        let mounts = read_mount_table();
+        assert!(!mounts.trees.is_empty(), "this machine has /etc");
+        for inside in ["etc", "usr/lib"] {
+            let path = root.join(inside);
+            assert!(aliased(&path, &homes(), &mounts.trees).is_some());
+            let plan = plan_against(&[target(&path, 1)], &root, &mounts);
+            assert!(plan.targets.is_empty(), "{inside}: {plan:?}");
+        }
+    }
+
     /// A loop device's image, an active swap file and a file mounted
     /// directly are refused, and so is every directory holding one, also
     /// when reached through a link above it.
@@ -2734,6 +2896,7 @@ mod tests {
             mounts: Some(crate::space::parse_mounts(table)),
             views: Vec::new(),
             pinned: Vec::new(),
+            trees: Vec::new(),
         };
         let marked = [
             target(Path::new("/home/tobi/junk"), 100),

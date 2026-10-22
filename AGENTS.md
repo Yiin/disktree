@@ -105,8 +105,10 @@ and `cargo build --release` directly; CI runs the gate on both systems.
    root, the home directory, any directory holding it, and symlink targets are
    refused. On Windows so is every directory directly in the profiles folder
    Windows reports (`FOLDERID_UserProfiles`, usually `C:\Users`); what is
-   inside a profile stays removable. On another machine the agent judges every
-   removal again on that machine. A real disk mounted whole under `/run`
+   inside a profile stays removable. System trees are judged by device and
+   inode as well as by spelling, so a link or bind of `/` shows no `/etc`
+   to remove. On another machine the agent judges every removal again on
+   that machine, and refuses a root that is not its own real path. A real disk mounted whole under `/run`
    (SparkOS's `/run/sparkos/host`) is judged by its paths on the disk and
    at each bind of it, not as part of `/run`.
 5. **Marks are keyed by absolute path**, not tree position, so they survive a
