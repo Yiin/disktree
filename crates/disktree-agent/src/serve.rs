@@ -374,7 +374,15 @@ mod tests {
         assert_eq!(read_preamble(&mut stream).unwrap(), PROTOCOL);
         let (first, hello) = read_frame(&mut stream).unwrap().unwrap();
         assert_eq!(first, tag::HELLO);
-        assert_eq!(Hello::decode(&hello, PROTOCOL).unwrap(), super::hello());
+        // Volumes carry free space, which moves between two readings.
+        let without_volumes = |mut hello: Hello| {
+            hello.volumes.clear();
+            hello
+        };
+        assert_eq!(
+            without_volumes(Hello::decode(&hello, PROTOCOL).unwrap()),
+            without_volumes(super::hello())
+        );
         let (failed, payload) = read_frame(&mut stream).unwrap().unwrap();
         assert_eq!(failed, tag::FAILED);
         let (id, reply) = Reply::decode(failed, &payload).unwrap();
