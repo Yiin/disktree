@@ -125,6 +125,9 @@ impl<'a> Decoder<'a> {
         // Ten groups of seven bits hold 64; an eleventh is a broken stream.
         for shift in (0..64).step_by(7) {
             let byte = self.u8()?;
+            if overflows(shift, byte) {
+                return Err(invalid("a varint longer than 64 bits"));
+            }
             value |= u64::from(byte & 0x7F) << shift;
             if byte & 0x80 == 0 {
                 return Ok(value);
@@ -251,6 +254,13 @@ pub fn write_frame(
     out.write_all(payload)
 }
 
+/// Whether `byte`, the varint group at `shift`, carries bits past 64. The
+/// tenth group has room for one: anything more would be shifted out and
+/// the value read short without a word.
+const fn overflows(shift: u32, byte: u8) -> bool {
+    shift == 63 && byte > 1
+}
+
 /// Read one frame, or `None` at a clean end of stream between frames.
 pub fn read_frame(input: &mut impl Read) -> io::Result<Option<(u8, Vec<u8>)>> {
     let mut tag = [0_u8];
@@ -262,6 +272,9 @@ pub fn read_frame(input: &mut impl Read) -> io::Result<Option<(u8, Vec<u8>)>> {
     for shift in (0..64).step_by(7) {
         let mut byte = [0_u8];
         input.read_exact(&mut byte)?;
+        if overflows(shift, byte[0]) {
+            break;
+        }
         len |= usize::from(byte[0] & 0x7F) << shift;
         if byte[0] & 0x80 == 0 {
             ended = true;
@@ -355,6 +368,25 @@ mod tests {
         let error = read_frame(&mut stream.as_slice()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("longer than 64 bits"), "{error}");
+    }
+
+    /// A tenth group above 1 would lose its high bits: nine continuation
+    /// bytes and a 2 read as 0, and the stream on from there.
+    #[test]
+    fn a_varint_whose_top_bits_would_be_lost_is_refused() {
+        let mut overlong = vec![0x80; 9];
+        overlong.push(0x02);
+        let error = Decoder::new(&overlong).uint().unwrap_err();
+        assert!(error.to_string().contains("longer than 64 bits"), "{error}");
+        let mut stream = vec![1];
+        stream.extend_from_slice(&overlong);
+        write_frame(&mut stream, 7, b"hello").unwrap();
+        let error = read_frame(&mut stream.as_slice()).unwrap_err();
+        assert!(error.to_string().contains("longer than 64 bits"), "{error}");
+        // The tenth group at 1 is the top bit, and still a number.
+        let mut top = vec![0x80; 9];
+        top.push(0x01);
+        assert_eq!(Decoder::new(&top).uint().unwrap(), 1 << 63);
     }
 
     #[test]
