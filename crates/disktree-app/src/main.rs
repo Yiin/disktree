@@ -43,6 +43,17 @@ use state::Disktree;
 
 /// What the command line asked for.
 #[derive(Debug)]
+enum Invocation {
+    /// Open the window.
+    Window(Args),
+    /// Print [`USAGE`].
+    Help,
+    /// Print [`version_line`].
+    Version,
+}
+
+/// What the window needs from the command line.
+#[derive(Debug)]
 struct Args {
     source: Source,
     /// Empty for another machine, whose root is known once it answers.
@@ -93,7 +104,20 @@ options:
                         best-effort host CPU budget; 0 disables it (80)
       --metric files    rank by file count instead of bytes
   -h, --help            show this help
+  -V, --version         print the version, the commit this binary was built
+                        from, and the agent it carries
 ";
+
+/// One line: the crate version, the commit this binary was built from, and
+/// the build id of the agent embedded in it. `build.rs` stamps the last two.
+fn version_line() -> String {
+    format!(
+        "disktree {} (commit {}, agent {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("DISKTREE_COMMIT"),
+        env!("DISKTREE_EMBEDDED_AGENT"),
+    )
+}
 
 fn main() -> Result<()> {
     #[cfg(windows)]
@@ -114,7 +138,20 @@ fn run() -> Result<()> {
             eprintln!("Cannot load Power Efficiency: {error}; using Balanced");
             power::PowerEfficiency::default()
         });
-    let args = parse_args_with_power(std::env::args_os().skip(1), saved)?;
+    // These answer on the command line and never open a window, so they go
+    // before the macOS re-exec: a detached child could not print them.
+    let args = match parse_args_with_power(std::env::args_os().skip(1), saved)?
+    {
+        Invocation::Window(args) => args,
+        Invocation::Help => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        Invocation::Version => {
+            println!("{}", version_line());
+            return Ok(());
+        }
+    };
 
     // When the app executable is reached through the command-line symlink,
     // cmux sends SIGTERM to its foreground process group as AppKit takes
@@ -216,16 +253,20 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// Read the command line, program name already skipped.
+/// Read the command line, program name already skipped, and insist on a
+/// window: what most tests are about.
 #[cfg(test)]
 fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Args> {
-    parse_args_with_power(args, power::PowerEfficiency::default())
+    match parse_args_with_power(args, power::PowerEfficiency::default())? {
+        Invocation::Window(args) => Ok(args),
+        other => panic!("not a window: {other:?}"),
+    }
 }
 
 fn parse_args_with_power(
     mut args: impl Iterator<Item = std::ffi::OsString>,
     preset: power::PowerEfficiency,
-) -> Result<Args> {
+) -> Result<Invocation> {
     let mut root: Option<std::ffi::OsString> = None;
     let mut sudo = false;
     let mut options = ScanOptions {
@@ -246,10 +287,10 @@ fn parse_args_with_power(
 
     while let Some(arg) = args.next() {
         match arg.to_str().unwrap_or_default() {
-            "-h" | "--help" => {
-                println!("{USAGE}");
-                std::process::exit(0);
-            }
+            // Answered before anything asks about a path: the parser must
+            // not open a window, or fail, to answer them.
+            "-h" | "--help" => return Ok(Invocation::Help),
+            "-V" | "--version" => return Ok(Invocation::Version),
             "-a" | "--apparent-size" => options.apparent_size = true,
             "-l" | "--follow-links" => options.follow_links = true,
             "-H" | "--no-hidden" => options.include_hidden = false,
@@ -364,13 +405,13 @@ fn parse_args_with_power(
         };
         let mut remote = Remote::new(host, Reach::Ssh { sudo }, ask);
         remote.bare = bare;
-        return Ok(Args {
+        return Ok(Invocation::Window(Args {
             source: Source::Remote(std::sync::Arc::new(remote)),
             root: PathBuf::new(),
             options,
             depth: depth.clamp(1, 6),
             power,
-        });
+        }));
     }
     anyhow::ensure!(
         !sudo,
@@ -404,13 +445,13 @@ fn parse_args_with_power(
         .with_context(|| format!("cannot read {}", root.display()))?;
     anyhow::ensure!(is_dir, "{} is not a directory", root.display());
 
-    Ok(Args {
+    Ok(Invocation::Window(Args {
         source,
         root,
         options,
         depth: depth.clamp(1, 6),
         power,
-    })
+    }))
 }
 
 /// Where the root argument points: here, or at another machine.
@@ -524,6 +565,14 @@ mod argument_tests {
             .map(std::ffi::OsString::from)
     }
 
+    /// Parse with a saved preset, insisting on a window.
+    fn saved_args(list: &[&str], preset: power::PowerEfficiency) -> Args {
+        match parse_args_with_power(arguments(list), preset).expect("parses") {
+            Invocation::Window(args) => args,
+            other => panic!("not a window: {other:?}"),
+        }
+    }
+
     #[test]
     fn adaptive_budget_and_fixed_override_are_explicit() {
         let args = parse_args(arguments(&[])).expect("defaults");
@@ -558,24 +607,18 @@ mod argument_tests {
         let path = dir.path().join("power-efficiency");
         power::save(&path, Power::Miser).expect("save");
         let saved = power::load(&path).expect("load");
-        let args = parse_args_with_power(arguments(&[]), saved).expect("saved");
+        let args = saved_args(&[], saved);
         assert_eq!(args.power, Some(Power::Miser));
         assert_eq!(
             args.options.threads.max_threads,
             2.min(power::cpu_threads())
         );
-        let args = parse_args_with_power(
-            arguments(&["--power-efficiency", "drain-my-battery"]),
-            saved,
-        )
-        .expect("override");
+        let args =
+            saved_args(&["--power-efficiency", "drain-my-battery"], saved);
         assert_eq!(args.power, Some(Power::DrainMyBattery));
         assert_eq!(args.options.threads.max_threads, power::cpu_threads());
-        let args = parse_args_with_power(
-            arguments(&["--scan-threads", "8", "--adaptive-threads"]),
-            saved,
-        )
-        .expect("experiment");
+        let args =
+            saved_args(&["--scan-threads", "8", "--adaptive-threads"], saved);
         assert!(args.power.is_none());
         assert!(args.options.threads.adaptive);
         assert_eq!(args.options.threads.max_threads, 8);
@@ -697,6 +740,59 @@ mod argument_tests {
         assert!(args(&["--sudo", "."]).is_err(), "sudo is for a host");
         let here = args(&["."]).expect("local");
         assert!(here.source.is_local());
+    }
+
+    #[test]
+    fn help_and_version_answer_before_any_path() {
+        let parse = |list: &[&str]| {
+            parse_args_with_power(
+                list.iter().copied().map(std::ffi::OsString::from),
+                power::PowerEfficiency::default(),
+            )
+        };
+        assert!(matches!(parse(&["-h"]), Ok(Invocation::Help)));
+        assert!(matches!(parse(&["--help"]), Ok(Invocation::Help)));
+        assert!(matches!(parse(&["-V"]), Ok(Invocation::Version)));
+        assert!(matches!(parse(&["--version"]), Ok(Invocation::Version)));
+        // They need no path, and options after them are not read.
+        assert!(matches!(
+            parse(&["--version", "/no/such/path"]),
+            Ok(Invocation::Version)
+        ));
+        // Before them, an unknown option is still an error.
+        assert!(parse(&["--nope", "--version"]).is_err());
+    }
+
+    #[test]
+    fn the_version_line_names_the_build() {
+        let line = version_line();
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(
+            line.starts_with(concat!(
+                "disktree ",
+                env!("CARGO_PKG_VERSION"),
+                " (commit "
+            )),
+            "{line}"
+        );
+        let commit = env!("DISKTREE_COMMIT");
+        let sha = commit.strip_suffix("-dirty").unwrap_or(commit);
+        assert!(
+            sha == "unknown"
+                || (sha.len() == 7
+                    && sha.chars().all(|c| c.is_ascii_hexdigit())),
+            "commit {commit}"
+        );
+        // A source id is 16 lowercase hex digits. The two phrases are the
+        // cases of no agent, and of agents the build has no record of.
+        let agent = env!("DISKTREE_EMBEDDED_AGENT");
+        assert!(
+            matches!(agent, "no agent" | "unknown agent")
+                || (agent.len() == 16
+                    && agent.chars().all(|c| c.is_ascii_hexdigit())),
+            "agent {agent}"
+        );
+        assert!(line.ends_with(&format!("agent {agent})")), "{line}");
     }
 
     #[test]
