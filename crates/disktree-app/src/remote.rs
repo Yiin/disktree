@@ -939,6 +939,36 @@ mod tests {
         assert_eq!(finished(&said), Ok(()));
     }
 
+    /// A stream cut between the script and the agent it carries: `dd` reads
+    /// the script whole, then `cat` finds nothing. The script's own length
+    /// check catches it, says how much arrived, and its `trap` leaves no
+    /// partial agent behind. Without that check the shell would exit 0 having
+    /// put an empty or short agent in place.
+    #[test]
+    fn an_install_cut_between_its_script_and_the_agent_says_so() {
+        let home = tempfile::tempdir().expect("home");
+        let shell = Shell::Local {
+            home: home.path().to_path_buf(),
+        };
+        let name = agent_name(FAKE);
+        let error = shell
+            .run_script(&install_script(&name, FAKE.len()), b"")
+            .expect_err("no agent arrived");
+        assert!(
+            error.contains(&format!("arrived with 0 of {} bytes", FAKE.len())),
+            "{error}"
+        );
+
+        let dir = home.path().join(AGENT_DIR);
+        assert!(!dir.join(&name).exists(), "a partial agent in place");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .expect("listing")
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
+    }
+
     #[test]
     fn a_present_agent_is_not_copied_again() {
         let home = tempfile::tempdir().expect("home");
@@ -1056,6 +1086,76 @@ mod tests {
         assert_eq!(client.hello().protocol, disktree_agent::PROTOCOL);
         let installed = dir.join(agent_name(real));
         assert!(installed.symlink_metadata().expect("there").is_file());
+    }
+
+    /// Two builds on two machines, one host. The probe sees this build's
+    /// agent, so nothing is installed; then the other build installs its
+    /// own and its cleanup takes this one away, since it was last started
+    /// ten days ago. Starting it fails, and it is installed again once and
+    /// started: the age rule and the one reinstall cover the gap between a
+    /// probe and a start. The other build's fresh agent is left alone.
+    #[test]
+    fn another_builds_cleanup_cannot_stop_this_one_starting() {
+        // `agents` hands out a `'static` slice, as the real one does.
+        static REAL: std::sync::LazyLock<Vec<u8>> =
+            std::sync::LazyLock::new(|| {
+                std::fs::read(built_agent()).expect("agent")
+            });
+        let real: &'static [u8] = REAL.as_slice();
+        let agents =
+            |arch: &str| (arch == std::env::consts::ARCH).then_some(real);
+        let home = tempfile::tempdir().expect("home");
+        let dir = home.path().join(AGENT_DIR);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let installed = dir.join(agent_name(real));
+        std::fs::write(&installed, real).expect("agent");
+        std::fs::set_permissions(
+            &installed,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("mode");
+        std::fs::File::options()
+            .write(true)
+            .open(&installed)
+            .and_then(|file| {
+                file.set_modified(
+                    std::time::SystemTime::now()
+                        - Duration::from_hours(10 * 24),
+                )
+            })
+            .expect("age it");
+        let shell = Shell::Local {
+            home: home.path().to_path_buf(),
+        };
+
+        let mut seen = Vec::new();
+        let mut took = false;
+        let mut taken_while_away = false;
+        let client = connect_installed(&shell, agents, false, |stage| {
+            seen.push(stage);
+            if stage != Stage::Starting || took {
+                return;
+            }
+            took = true;
+            // The other build, between this one's probe and its start.
+            let (outcome, other) = stages(&shell);
+            assert_eq!(
+                outcome,
+                Ok(format!("{AGENT_DIR}/{}", agent_name(FAKE)))
+            );
+            assert_eq!(other, [Stage::Installing, Stage::Starting]);
+            taken_while_away = !installed.exists();
+        })
+        .expect("connected after installing again");
+
+        assert_eq!(seen, [Stage::Starting, Stage::Installing, Stage::Starting]);
+        assert!(taken_while_away, "the cleanup left the aged agent");
+        assert_eq!(client.hello().protocol, disktree_agent::PROTOCOL);
+        assert_eq!(std::fs::read(&installed).expect("back"), real);
+        assert!(
+            dir.join(agent_name(FAKE)).exists(),
+            "this one's installed again agent left the other's alone"
+        );
     }
 
     #[test]
