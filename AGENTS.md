@@ -23,7 +23,7 @@ make lint                       # rustfmt --check, then clippy --all-targets -D 
 make test                       # core and window-harness tests
 make ci                         # lint, then test
 make fmt                        # format in place
-cargo xtask agent               # static Linux agents in target/agent/
+make agent                      # static Linux agents in target/agent/ (cargo xtask agent)
 ```
 
 `make install` is the supported way to put this on a machine: it installs the
@@ -37,12 +37,17 @@ On macOS `make install` installs `target/bundle/disktree.app` into
 `packaging/macos/` (the `Info.plist` template and the icon's SVG). The bundle
 identifier there keys every macOS permission grant; do not change it lightly.
 
-`cargo xtask agent` cross-builds the remote agent for aarch64 and x86_64
-musl. It needs rustup's standard library for both targets (`rustup target
-add aarch64-unknown-linux-musl x86_64-unknown-linux-musl`, run through
-rustup's cargo) and zig on `PATH` or in `ZIG`, which compiles mimalloc:
-musl's own malloc made a static agent scan 4.5 times slower. Lint and
-test build the agent for the host only and need neither.
+`make agent` (`cargo xtask agent`) cross-builds the remote agent for
+aarch64 and x86_64 musl. It needs rustup's standard library for both
+targets (`rustup target add aarch64-unknown-linux-musl
+x86_64-unknown-linux-musl`) and zig, which compiles mimalloc: musl's own
+malloc made a static agent scan 4.5 times slower. xtask finds a rustup in
+`~/.local/share/{rustup,cargo}` and zig on `PATH` or in
+`~/.local/share/zig`; `RUSTUP_HOME`, `CARGO_HOME` and `ZIG` override
+them. The app's build script embeds whatever is in `target/agent`, so
+`make install` builds the agents first. Lint and test build the agent for
+the host only and need neither; without `target/agent` the app builds and
+`disktree HOST` says to run `make agent`.
 
 `cargo xtask lint` is the gate. It must be green before anything is called
 done, and it must not fix anything: a red local run is the same signal CI gives.
@@ -95,7 +100,10 @@ and `cargo build --release` directly; CI runs the gate on both systems.
    root, the home directory, any directory holding it, and symlink targets are
    refused. On Windows so is every directory directly in the profiles folder
    Windows reports (`FOLDERID_UserProfiles`, usually `C:\Users`); what is
-   inside a profile stays removable.
+   inside a profile stays removable. On another machine the agent judges every
+   removal again on that machine. A real disk mounted whole under `/run`
+   (SparkOS's `/run/sparkos/host`) is judged by its paths on the disk and
+   at each bind of it, not as part of `/run`.
 5. **Marks are keyed by absolute path**, not tree position, so they survive a
    re-scan; `Marks::refresh` re-reads their sizes and drops what is gone.
 6. **The treemap is painted, not composed of elements.** Thousands of
@@ -131,6 +139,8 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | how a tree is encoded for the wire | `crates/disktree-agent/src/tree_codec.rs` |
 | what the agent does with a request | `crates/disktree-agent/src/serve.rs` |
 | the app's handle on a remote agent | `crates/disktree-agent/src/client.rs` |
+| ssh, installing the agent, a host's default root | `crates/disktree-app/src/remote.rs` |
+| what a source answers, here or there | `crates/disktree-app/src/source.rs` |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |

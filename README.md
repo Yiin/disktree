@@ -130,6 +130,7 @@ See [On Windows](#on-windows) for what differs there.
 disktree            # scan the home directory
 disktree --disk     # the whole disk it lives on
 disktree ~/src      # or any directory
+disktree spark-1    # another machine, over ssh
 disktree --help     # options: apparent size, follow links, skip hidden, …
 ```
 
@@ -347,6 +348,54 @@ The same program, with Windows' answers to the questions above:
 - **The theme** follows Windows' light or dark setting, since there is no
   Omarchy theme to follow. It does on macOS too, and on GNOME and KDE.
 
+## Another machine
+
+`disktree spark-1` opens the usual window on spark-1's disk. A small agent
+does the scan there at local disk speed and sends the tree back, so a disk
+with millions of files lands in seconds. The free-space meter, marking,
+review and removal all work, and the title and the trail start with the
+host's name.
+
+```sh
+disktree spark-1              # the default root there
+disktree spark-1:/srv/models  # a path there
+disktree spark-1:models       # relative to the home directory there
+disktree spark-1 --sudo       # as root, through sudo -n
+disktree -D spark-1           # the whole disk its home directory is on
+```
+
+The argument follows scp's rule: a `:` before any `/` means `host:path`,
+and a bare word that is not a local path is a host. Write `./name` for a
+local folder named like a host. The host is reached the way `ssh host`
+reaches it, with your own ssh config and keys. disktree never asks for a
+password: ssh runs with `BatchMode=yes`, and `--sudo` needs sudo that does
+not ask for one there.
+
+The default root is the home directory there. On SparkOS it is
+`/run/sparkos/host`, the machine's real disk, of which `/` is only a small
+overlay.
+
+On connecting, disktree copies the agent for the host's architecture to
+`~/.cache/disktree/agent-<hash>` there if it is missing, and removes the
+agents older releases left in that folder. The agents are static Linux
+binaries for aarch64 and x86_64, and the app carries them:
+`make install` builds them first (`make agent`), which needs rustup with
+both musl targets (`rustup target add aarch64-unknown-linux-musl
+x86_64-unknown-linux-musl`) and zig. A rustup and zig under
+`~/.local/share` are found without changing `PATH`; `RUSTUP_HOME`,
+`CARGO_HOME` and `ZIG` name others. A disktree built without them works
+here and says what to run when asked to scan another machine.
+
+The removal rules run on the host, against its own mounts and home
+directory: the agent plans what it is asked to remove again and refuses
+what its plan refuses. Under `--sudo` the home directory the rules protect
+is still yours. Showing a path in the file manager, the folder picker and
+restarting as administrator are about this machine and say so. A remote
+scan is not memoized when it widens.
+
+If the connection drops, the window stays open with the reason, and `r`
+connects again and scans.
+
 ## What it refuses to do
 
 The removal rules live in `crates/disktree-core/src/removal.rs`, and each one is
@@ -366,6 +415,12 @@ tested:
   `/gnu/store`, Homebrew's prefix on macOS and Linux, …) are
   refused even where permissions would allow it: packages own them, and
   pacman, paccache or `journalctl --vacuum` are the tools;
+- `/run` is a system tree too, except for a disk the desktop mounted under
+  `/run/media`, and a real disk mounted whole under `/run`, like SparkOS's
+  `/run/sparkos/host`: a path on that disk is judged by where it sits on
+  the disk and at every other mount that shows it, so `…/host/home/you/x`
+  goes, while `…/host/usr`, `…/host/var/lib/docker` and the folders
+  `/home` or `/srv` are mounted from stay;
 - a symlink is unlinked, never followed;
 - nothing is passed through a shell — a file called `-rf` is just a file;
 - selecting a checkout never runs a program it names: git is asked with its
@@ -387,6 +442,7 @@ windowrule = size 1400 900, class:^(disktree)$
 
 ```sh
 make run      # release build, scanning $HOME
+make agent    # the static agents for another machine, in target/agent
 make lint     # rustfmt --check, then clippy with every warning an error
 make test     # scanner, layout and removal tests, plus window-harness tests
 make ci       # lint, then test
@@ -401,6 +457,8 @@ gone while their neighbours are not.
 | path | what lives there |
 | --- | --- |
 | `crates/disktree-core` | scanning, the tree, the squarified layout, free space and removal — no UI |
+| `crates/disktree-agent` | the headless agent for another machine, its protocol and its client |
+| `crates/disktree-app/src/remote.rs` | reaching a host over ssh and installing the agent there |
 | `crates/disktree-app/src/state.rs` | every action the interface can take, and the key map |
 | `crates/disktree-app/src/views.rs` | the screens |
 | `crates/disktree-app/src/treemap_view.rs` | painting the mosaic and its labels |

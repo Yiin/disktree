@@ -2053,3 +2053,173 @@ fn a_remote_source_scans_marks_and_removes_through_its_agent(
     );
     assert!(outside.path().exists(), "the kept-back mark is untouched");
 }
+
+/// An agent that introduces itself and dies: the window says why, keeps
+/// running, and `r` connects again.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_lost_agent_is_said_and_r_reconnects(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use crate::remote::{Ask, Reach, Remote};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let mut introduction = disktree_agent::protocol::preamble();
+    disktree_agent::wire::write_frame(
+        &mut introduction,
+        disktree_agent::protocol::tag::HELLO,
+        &disktree_agent::serve::hello().encode(),
+    )
+    .expect("hello");
+    let scripts = tempfile::TempDir::new().expect("scripts");
+    let hello = scripts.path().join("hello");
+    std::fs::write(&hello, introduction).expect("write hello");
+    let agent = scripts.path().join("agent");
+    std::fs::write(
+        &agent,
+        format!(
+            "#!/bin/sh\ncat '{}'\necho 'agent crashed' >&2\n",
+            hello.display()
+        ),
+    )
+    .expect("write agent");
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+
+    let remote = Remote::new(
+        "testhost".into(),
+        Reach::Direct(agent),
+        Ask::Path(temp.path().to_path_buf()),
+    );
+    let source = Source::Remote(std::sync::Arc::new(remote));
+    let (view, cx) = cx.add_window_view(move |_, cx| {
+        Disktree::with_source(source, PathBuf::new(), options(), 3, cx)
+    });
+    draw(cx);
+    // Whichever request meets the closed connection first fails with the
+    // reason: checking the root, or the scan.
+    let mut error = None;
+    for _ in 0..2_000 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let epoch = read(&view, cx, |app| app.scan_epoch);
+        update(&view, cx, |app, cx| {
+            app.poll_connect_once(epoch, cx);
+            let epoch = app.scan_epoch;
+            app.poll_scan_once(epoch, cx);
+        });
+        error = read(&view, cx, |app| app.scan_error.clone());
+        if error.is_some() {
+            break;
+        }
+    }
+    draw(cx);
+    let error = error.expect("the loss is said");
+    assert!(error.contains("agent crashed"), "{error}");
+    assert!(read(&view, cx, |app| app.connecting.is_none()));
+
+    let focus = view.read_with(cx, |app, _| app.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    press(cx, "r");
+    assert!(
+        read(&view, cx, |app| app.connecting.is_some()),
+        "r connects again"
+    );
+}
+
+/// The real thing, headless: `DISKTREE_LIVE_HOST=spark-2` (and
+/// `DISKTREE_LIVE_SUDO=1` for `--sudo`) connects over ssh, installs the
+/// agent this build carries, scans the default root through the window's
+/// own code path, and prints what it found. Removes nothing; it only asks
+/// the agent to plan two paths. Needs `make agent` before the build.
+#[gpui_kit::test]
+#[ignore = "needs a reachable host: DISKTREE_LIVE_HOST"]
+fn live_remote_scan(cx: &mut TestAppContext) {
+    use crate::remote::{Ask, Reach, Remote};
+
+    let host = std::env::var("DISKTREE_LIVE_HOST").expect("DISKTREE_LIVE_HOST");
+    let sudo = std::env::var_os("DISKTREE_LIVE_SUDO").is_some();
+    cx.update(gpui_omarchy::init);
+    let started = std::time::Instant::now();
+    let remote = Remote::new(host, Reach::Ssh { sudo }, Ask::Default);
+    let source = Source::Remote(std::sync::Arc::new(remote));
+    let (view, cx) = cx.add_window_view(move |_, cx| {
+        Disktree::with_source(
+            source,
+            PathBuf::new(),
+            ScanOptions::default(),
+            3,
+            cx,
+        )
+    });
+    finish_connect(&view, cx);
+    let connected = started.elapsed();
+    finish_scan(&view, cx);
+    let scanned = started.elapsed();
+    draw(cx);
+
+    fn nodes(node: &disktree_core::tree::Node) -> u64 {
+        1 + node.children.iter().map(nodes).sum::<u64>()
+    }
+    let (root, title, tree, space, home, trash) = read(&view, cx, |app| {
+        let tree = app.tree().expect("tree");
+        (
+            crate::widgets::display_root(app),
+            app.source.title(&crate::marks::display_path(
+                &app.root_path,
+                app.home.as_deref(),
+            )),
+            (nodes(tree), tree.files, tree.dirs, tree.bytes),
+            app.space,
+            app.home.clone(),
+            app.trash_backend,
+        )
+    });
+    println!("root           {root}");
+    println!("title          {title}");
+    println!("sudo           {sudo}");
+    println!("home           {home:?}");
+    println!("trash          {trash:?}");
+    println!("nodes          {}", tree.0);
+    println!("files, dirs    {}, {}", tree.1, tree.2);
+    println!(
+        "bytes          {} ({})",
+        tree.3,
+        disktree_core::size::human_bytes(tree.3)
+    );
+    if let Some(space) = space {
+        println!(
+            "free space     {} of {} available",
+            disktree_core::size::human_bytes(space.available),
+            disktree_core::size::human_bytes(space.total)
+        );
+    }
+    println!("connected in   {connected:.2?}");
+    println!("scanned in     {:.2?} (from start)", scanned);
+
+    let root_path = read(&view, cx, |app| app.root_path.clone());
+    let plan = read(&view, cx, |app| {
+        let target = |path: PathBuf| disktree_core::removal::Target {
+            path,
+            bytes: 0,
+            is_dir: true,
+            hidden: false,
+        };
+        let mut targets = vec![target(root_path.join("usr"))];
+        if let Some(home) = &app.home {
+            let inside = home.strip_prefix("/").unwrap_or(home);
+            targets.push(target(root_path.join(inside).join(".cache")));
+        }
+        app.source.plan(&targets, &root_path)
+    });
+    for target in &plan.targets {
+        println!("plan allows    {}", target.path.display());
+    }
+    for blocked in &plan.blocked {
+        println!(
+            "plan refuses   {}: {}",
+            blocked.path.display(),
+            blocked.reason
+        );
+    }
+}
