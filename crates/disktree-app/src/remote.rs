@@ -311,13 +311,15 @@ impl Remote {
     /// waits: until the answer lands, and when it cannot be asked, every
     /// target is kept back with the reason, since a plan nobody judged
     /// removes nothing. Only an answer is kept; a failure is asked again
-    /// after [`RETRY`].
+    /// after [`RETRY`]. A lost connection keeps no answer: a Delete on it
+    /// could only fail, so the review says why before it is pressed.
     pub fn plan(&self, targets: &[Target], root: &Path) -> Plan {
         let link = lock(&self.link);
         let generation = link.generation;
         let client = link.connection.clone();
         drop(link);
-        let Some(client) = client else {
+        let Some(client) = client.filter(|client| client.closed().is_none())
+        else {
             let reason = format!("not connected to {}", self.host);
             return refuse_all(targets, root, &reason);
         };

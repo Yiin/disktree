@@ -2904,6 +2904,12 @@ impl Disktree {
                     self.screen = Screen::Explore;
                     cx.notify();
                 }
+                // What the outcome-unknown screen offers: only a rescan
+                // can say what went.
+                if key == "r" && self.run_summary.lost.is_some() {
+                    self.screen = Screen::Explore;
+                    self.start_scan(cx);
+                }
             }
         }
     }

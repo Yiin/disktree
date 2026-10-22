@@ -400,6 +400,15 @@ fn a_removal_whose_link_is_lost_says_the_outcome_is_unknown(
     );
     assert_eq!(marks, 1, "the marks stay for the rescan");
     assert!(!scanning, "no scan into a lost connection");
+
+    // The screen says to press r, and r does it.
+    let focus = view.read_with(cx, |app, _| app.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    press(cx, "r");
+    let (screen, scanning) =
+        read(&view, cx, |app| (app.screen, app.scan.is_some()));
+    assert_eq!(screen, Screen::Explore);
+    assert!(scanning, "r scans again");
 }
 
 /// A subdivided directory keeps a band at the top for its own name, and its
@@ -2262,6 +2271,98 @@ fn a_lost_agent_is_said_and_r_reconnects(cx: &mut TestAppContext) {
         read(&view, cx, |app| app.connecting.is_some()),
         "r connects again"
     );
+}
+
+/// The link drops while the review is open: the plan the agent answered
+/// is not kept, every mark is kept back as not connected, and Delete says
+/// so instead of starting a removal whose outcome could not be known.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_lost_link_keeps_every_mark_back_and_delete_says_why(
+    cx: &mut TestAppContext,
+) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use crate::remote::{Ask, Reach, Remote};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let root = std::fs::canonicalize(temp.path()).expect("root");
+    // The real agent, behind a script that says its process id, so the
+    // test can end it as a dropped link would.
+    let scripts = tempfile::TempDir::new().expect("scripts");
+    let pid = scripts.path().join("pid");
+    let agent = scripts.path().join("agent");
+    std::fs::write(
+        &agent,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec '{}' \"$@\"\n",
+            pid.display(),
+            local_agent().display()
+        ),
+    )
+    .expect("write agent");
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    let remote = Remote::new(
+        "testhost".into(),
+        Reach::Direct(agent),
+        Ask::Path(root.clone()),
+    );
+    let source = Source::Remote(std::sync::Arc::new(remote));
+    let (view, cx) = cx.add_window_view(move |_, cx| {
+        Disktree::with_source(source, PathBuf::new(), options(), 3, cx)
+    });
+    let focus = view.read_with(cx, |app, _| app.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    draw(cx);
+    finish_connect(&view, cx);
+    finish_scan(&view, cx);
+    update(&view, cx, |app, cx| {
+        app.removal_mode = RemovalMode::Permanent;
+        let junk = app
+            .tree()
+            .and_then(|tree| {
+                tree.children
+                    .iter()
+                    .position(|child| &*child.name == "junk")
+            })
+            .expect("junk");
+        app.toggle_mark(&[junk], cx);
+    });
+    assert_eq!(
+        settled_plan(&view, cx).targets.len(),
+        1,
+        "judged and allowed"
+    );
+    press(cx, "c");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+
+    let agent_pid = std::fs::read_to_string(&pid).expect("the agent's pid");
+    let killed = std::process::Command::new("kill")
+        .arg(agent_pid.trim())
+        .status()
+        .expect("kill");
+    assert!(killed.success());
+    for _ in 0..2_000 {
+        if read(&view, cx, |app| app.source.lost().is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(read(&view, cx, |app| app.source.lost().is_some()), "lost");
+
+    let plan = read(&view, cx, Disktree::plan);
+    assert!(plan.targets.is_empty(), "{plan:?}");
+    assert_eq!(plan.blocked.len(), 1, "{plan:?}");
+    assert_eq!(plan.blocked[0].reason, "not connected to testhost");
+    update(&view, cx, Disktree::begin_removal);
+    let (screen, notice) =
+        read(&view, cx, |app| (app.screen, app.notice.clone()));
+    assert_eq!(screen, Screen::Review, "no removal started");
+    let (notice, _) = notice.expect("a notice says why");
+    assert!(notice.contains("not connected to testhost"), "{notice}");
+    assert!(root.join("junk").exists());
 }
 
 fn nodes(node: &disktree_core::tree::Node) -> u64 {
