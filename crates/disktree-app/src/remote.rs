@@ -24,7 +24,7 @@ use std::thread;
 use std::time::Duration;
 
 use disktree_agent::{Client, Hello, PathInfo, SpaceReport};
-use disktree_core::removal::{Blocked, Plan, Target};
+use disktree_core::removal::{Blocked, Plan, Target, TrashBackend};
 
 /// Where the agent is installed, under the remote home directory.
 const AGENT_DIR: &str = ".cache/disktree";
@@ -141,6 +141,12 @@ impl Remote {
 
     pub fn hello(&self) -> Option<Hello> {
         self.client().map(|client| client.hello().clone())
+    }
+
+    /// The trash removals there go to: none under `--sudo`; see
+    /// [`trash_offered`].
+    pub fn trash_backend(&self) -> TrashBackend {
+        trash_offered(&self.reach, self.hello().as_ref())
     }
 
     /// Reach the host, install the agent if it is missing, and start it.
@@ -561,6 +567,19 @@ done
     )
 }
 
+/// The trash a host's agent offers, as the review screen may offer it.
+///
+/// None under `--sudo`, whatever the agent says: it runs as root with the
+/// ssh user's `HOME`, so every entry would land in the user's trash owned
+/// by root, and only root could empty it. The agent refuses that itself,
+/// too; this keeps the choice off screen.
+const fn trash_offered(reach: &Reach, hello: Option<&Hello>) -> TrashBackend {
+    match (reach, hello) {
+        (Reach::Ssh { sudo: true }, _) | (_, None) => TrashBackend::Unavailable,
+        (_, Some(hello)) => hello.trash,
+    }
+}
+
 /// Start the installed agent, under `sudo -n` when asked. Under sudo,
 /// `HOME` stays the ssh user's: the removal guards protect the home
 /// directory, and root's would leave the user's unguarded.
@@ -744,6 +763,20 @@ mod tests {
             Some(PathBuf::from("/srv"))
         );
         assert_eq!(first_root(&Ask::Default, &hello(None, &[])), None);
+    }
+
+    #[test]
+    fn sudo_never_offers_the_trash() {
+        let mut said = hello(Some("/home/me"), &[]);
+        said.trash = TrashBackend::XdgHome;
+        let offered = |sudo| trash_offered(&Reach::Ssh { sudo }, Some(&said));
+        assert_eq!(offered(false), TrashBackend::XdgHome);
+        assert_eq!(offered(true), TrashBackend::Unavailable);
+        assert_eq!(
+            trash_offered(&Reach::Ssh { sudo: false }, None),
+            TrashBackend::Unavailable,
+            "not connected"
+        );
     }
 
     #[test]

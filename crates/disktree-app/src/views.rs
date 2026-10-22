@@ -2750,15 +2750,28 @@ fn review_summary(
         cx,
     );
 
-    let explanation = match app.removal_mode {
-        RemovalMode::Trash => format!(
+    let explanation = match (app.removal_mode, app.source.host()) {
+        (RemovalMode::Trash, None) => format!(
             "Recoverable from the trash until it is emptied. Uses {}.",
             app.trash_backend.label()
         ),
-        RemovalMode::Permanent => {
+        // The meter here cannot see that trash: the space stays used on
+        // that host until somebody empties it there.
+        (RemovalMode::Trash, Some(host)) => format!(
+            "Recoverable from the trash on {host} until it is emptied \
+             there; the space comes back only then. Uses {}.",
+            app.trash_backend.label()
+        ),
+        (RemovalMode::Permanent, _) => {
             "Deleted at once, like rm -rf. Nothing is recoverable.".to_string()
         }
     };
+    let trash_off = app.source.trash_off().map(|why| {
+        div()
+            .text_size(text::CAPTION)
+            .text_color(theme.secondary)
+            .child(why)
+    });
 
     let mut panel = div()
         .flex()
@@ -2782,7 +2795,8 @@ fn review_summary(
                         .text_size(text::CAPTION)
                         .text_color(theme.secondary)
                         .child(explanation),
-                ),
+                )
+                .children(trash_off),
         )
         .child(
             div()

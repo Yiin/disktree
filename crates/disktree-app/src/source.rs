@@ -55,7 +55,7 @@ use disktree_core::scan::{Known, ScanHandle, ScanOptions, ScanSnapshot};
 use disktree_core::space::{SpaceInfo, Volume};
 use disktree_core::tree::Node;
 
-use crate::remote::Remote;
+use crate::remote::{Reach, Remote};
 use disktree_core::git::GitState;
 
 /// The machine whose disk is explored.
@@ -301,9 +301,24 @@ impl Source {
     pub fn trash_backend(&self) -> TrashBackend {
         match self {
             Self::Local => disktree_core::removal::detect_trash_backend(),
-            Self::Remote(remote) => remote
-                .hello()
-                .map_or(TrashBackend::Unavailable, |hello| hello.trash),
+            Self::Remote(remote) => remote.trash_backend(),
+        }
+    }
+
+    /// Why trash mode is off, where the reason is not the machine's lack
+    /// of a trash tool: under `--sudo` it would fill the user's trash with
+    /// root's entries.
+    pub fn trash_off(&self) -> Option<&'static str> {
+        match self {
+            Self::Remote(remote)
+                if matches!(remote.reach, Reach::Ssh { sudo: true }) =>
+            {
+                Some(
+                    "No trash under --sudo: root's entries in your trash \
+                     would need root to empty.",
+                )
+            }
+            _ => None,
         }
     }
 

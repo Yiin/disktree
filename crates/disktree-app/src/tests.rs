@@ -2224,3 +2224,100 @@ fn live_remote_scan(cx: &mut TestAppContext) {
         );
     }
 }
+
+/// A real removal, headless: `DISKTREE_LIVE_HOST=spark-2`,
+/// `DISKTREE_LIVE_ROOT`, the folder to scan there, and
+/// `DISKTREE_LIVE_MARK`, the one name in it to mark, removed through the
+/// review screen in `DISKTREE_LIVE_MODE` (`trash` or `permanent`), with
+/// `DISKTREE_LIVE_SUDO=1` for `--sudo`. Removes that one path and nothing
+/// else; point it at a scratch folder.
+#[gpui_kit::test]
+#[ignore = "removes a file on a reachable host: DISKTREE_LIVE_HOST"]
+fn live_remote_removal(cx: &mut TestAppContext) {
+    use crate::remote::{Ask, Reach, Remote};
+
+    let var = |name: &str| std::env::var(name).expect(name);
+    let host = var("DISKTREE_LIVE_HOST");
+    let root = PathBuf::from(var("DISKTREE_LIVE_ROOT"));
+    let mark = var("DISKTREE_LIVE_MARK");
+    let mode = match var("DISKTREE_LIVE_MODE").as_str() {
+        "trash" => RemovalMode::Trash,
+        "permanent" => RemovalMode::Permanent,
+        other => panic!("DISKTREE_LIVE_MODE is trash or permanent: {other}"),
+    };
+    let sudo = std::env::var_os("DISKTREE_LIVE_SUDO").is_some();
+    cx.update(gpui_omarchy::init);
+    let remote = Remote::new(host, Reach::Ssh { sudo }, Ask::Path(root));
+    let source = Source::Remote(std::sync::Arc::new(remote));
+    let (view, cx) = cx.add_window_view(move |_, cx| {
+        Disktree::with_source(
+            source,
+            PathBuf::new(),
+            ScanOptions::default(),
+            3,
+            cx,
+        )
+    });
+    let focus = view.read_with(cx, |app, _| app.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    finish_connect(&view, cx);
+    finish_scan(&view, cx);
+    draw(cx);
+
+    let (trash, trash_off) =
+        read(&view, cx, |app| (app.trash_backend, app.source.trash_off()));
+    println!("sudo           {sudo}");
+    println!("trash          {trash:?}");
+    println!("trash off      {trash_off:?}");
+    update(&view, cx, |app, cx| {
+        let index = app
+            .tree()
+            .and_then(|tree| {
+                tree.children.iter().position(|c| *c.name == *mark)
+            })
+            .expect("the mark is in the root");
+        app.toggle_mark(&[index], cx);
+    });
+    press(cx, "c");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+    press(cx, if mode == RemovalMode::Trash { "m" } else { "p" });
+    draw(cx);
+    println!(
+        "mode           {:?}",
+        read(&view, cx, |app| app.removal_mode)
+    );
+    press(cx, "enter");
+    if read(&view, cx, |app| app.confirm_open) {
+        press(cx, "enter");
+    }
+    assert_eq!(
+        read(&view, cx, |app| app.screen),
+        Screen::Running,
+        "the removal started"
+    );
+
+    let epoch = read(&view, cx, |app| app.run_epoch);
+    let mut finished = false;
+    for _ in 0..12_000 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        finished = update(&view, cx, |app, cx| {
+            app.poll_removal_once(epoch, cx);
+            app.screen == Screen::Done
+        });
+        if finished {
+            break;
+        }
+    }
+    assert!(finished, "the removal finished");
+    let (summary, log) = read(&view, cx, |app| {
+        (app.run_summary.clone(), app.run_log.clone())
+    });
+    for (path, outcome) in &log {
+        println!("item           {}: {outcome:?}", path.display());
+    }
+    println!(
+        "summary        removed {}, failed {}, {} bytes",
+        summary.removed, summary.failed, summary.bytes
+    );
+    assert_eq!(summary.failed, 0, "{log:?}");
+}
