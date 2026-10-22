@@ -360,13 +360,17 @@ host's name.
 disktree spark-1              # the default root there
 disktree spark-1:/srv/models  # a path there
 disktree spark-1:models       # relative to the home directory there
+disktree spark-1:~/models     # the same, as scp spells it
+disktree '[fe80::1]:/srv'     # an IPv6 address, in brackets
 disktree spark-1 --sudo       # as root, through sudo -n
 disktree -D spark-1           # the whole disk its home directory is on
 ```
 
-The argument follows scp's rule: a `:` before any `/` means `host:path`,
-and a bare word that is not a local path is a host. Write `./name` for a
-local folder named like a host. The host is reached the way `ssh host`
+The argument follows scp's rule: a path that exists here is local, even
+one with a `:` in its name or a link that leads nowhere. Otherwise a `:`
+before any `/` means `host:path`, and a bare word is a host. Write
+`./name` for a local folder named like a host. A bare word ssh cannot
+resolve is reported as "no local path or ssh host named" it. The host is reached the way `ssh host`
 reaches it, with your own ssh config and keys. disktree never asks for a
 password: ssh runs with `BatchMode=yes`, and `--sudo` needs sudo that does
 not ask for one there.

@@ -344,8 +344,11 @@ fn parse_args_with_power(
         }
     }
 
-    let place = root.map(|root| place(root, Path::exists));
-    if let Some(Place::Remote { host, path }) = place.clone() {
+    // A link counts as there even when it leads nowhere: it is a local
+    // name, and a dangling one is a local error, not a host.
+    let place =
+        root.map(|root| place(root, |path| path.symlink_metadata().is_ok()));
+    if let Some(Place::Remote { host, path, bare }) = place.clone() {
         anyhow::ensure!(
             !(disk && path.is_some()),
             "--disk and a PATH cannot be combined"
@@ -355,7 +358,8 @@ fn parse_args_with_power(
             None if disk => Ask::Disk,
             None => Ask::Default,
         };
-        let remote = Remote::new(host, Reach::Ssh { sudo }, ask);
+        let mut remote = Remote::new(host, Reach::Ssh { sudo }, ask);
+        remote.bare = bare;
         return Ok(Args {
             source: Source::Remote(std::sync::Arc::new(remote)),
             root: PathBuf::new(),
@@ -410,19 +414,41 @@ fn parse_args_with_power(
 enum Place {
     Local(PathBuf),
     /// `path` is `None` for `host` and `host:`: the default root there.
+    /// `bare` when the word had no `:`, and is a host only because no
+    /// local path has that name.
     Remote {
         host: String,
         path: Option<PathBuf>,
+        bare: bool,
     },
 }
 
-/// scp's rule. A `:` before any `/` makes `host:path`; a bare word with no
-/// `/` that `exists` does not find here is a host; everything else is a
-/// local path, so `./spark-1` is the folder.
+/// scp's rule, after one of its own: a path that `exists` here is local,
+/// whatever it holds. Then a `:` before any `/` makes `host:path`, with
+/// `[address]:path` for an IPv6 address; a bare word with no `/` is a
+/// host; everything else is a local path, so `./spark-1` is the folder.
 fn place(arg: std::ffi::OsString, exists: impl Fn(&Path) -> bool) -> Place {
     let Some(text) = arg.to_str() else {
         return Place::Local(PathBuf::from(arg));
     };
+    if exists(Path::new(text)) {
+        return Place::Local(PathBuf::from(arg));
+    }
+    let remote = |host: &str, path: &str, bare: bool| Place::Remote {
+        host: host.to_owned(),
+        path: (!path.is_empty()).then(|| PathBuf::from(path)),
+        bare,
+    };
+    // `[fe80::1]:path` and `me@[fe80::1]:path`: the colons inside the
+    // brackets are the address's. ssh takes the address without them.
+    if let Some((user, rest)) = bracketed(text)
+        && let Some((address, after)) = rest.split_once(']')
+        && let Some(path) = after
+            .strip_prefix(':')
+            .or_else(|| after.is_empty().then_some(""))
+    {
+        return remote(&format!("{user}{address}"), path, false);
+    }
     let separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
     let slash = text.find(separator).unwrap_or(text.len());
     if let Some(colon) = text[..slash].find(':') {
@@ -430,20 +456,24 @@ fn place(arg: std::ffi::OsString, exists: impl Fn(&Path) -> bool) -> Place {
         // `C:\Users` is a drive on Windows, not a host named C.
         let drive = cfg!(windows) && host.len() == 1;
         if !host.is_empty() && !drive {
-            return Place::Remote {
-                host: host.to_owned(),
-                path: (!path.is_empty()).then(|| PathBuf::from(path)),
-            };
+            return remote(host, path, false);
         }
     }
     let bare = slash == text.len() && !matches!(text, "" | "." | ".." | "~");
-    if bare && !exists(Path::new(text)) {
-        return Place::Remote {
-            host: text.to_owned(),
-            path: None,
-        };
+    if bare {
+        return remote(text, "", true);
     }
     Place::Local(PathBuf::from(arg))
+}
+
+/// `text` split after `user@[` or `[`, when it starts with either.
+fn bracketed(text: &str) -> Option<(&str, &str)> {
+    let open = text.find('[')?;
+    let user = &text[..open];
+    (user.is_empty()
+        || (user.ends_with('@')
+            && !user[..user.len() - 1].contains(['/', ':', '@'])))
+    .then(|| (user, &text[open + 1..]))
 }
 
 /// The console of the terminal disktree was started from, if any: a
@@ -580,13 +610,36 @@ mod argument_tests {
         let remote = |host: &str, path: Option<&str>| Place::Remote {
             host: host.into(),
             path: path.map(PathBuf::from),
+            bare: false,
+        };
+        let bare = |host: &str| Place::Remote {
+            host: host.into(),
+            path: None,
+            bare: true,
         };
         let local = |path: &str| Place::Local(PathBuf::from(path));
-        let here = |path: &Path| path == Path::new("projects");
+        // What is here: a folder, a folder with a colon in its name, and
+        // a link that leads nowhere.
+        let here = |path: &Path| {
+            ["projects", "backup:2024", "dangling"]
+                .iter()
+                .any(|name| path == Path::new(name))
+        };
         for (arg, expected) in [
-            ("spark-1", remote("spark-1", None)),
-            ("me@spark-1", remote("me@spark-1", None)),
+            ("spark-1", bare("spark-1")),
+            ("me@spark-1", bare("me@spark-1")),
             ("spark-1:", remote("spark-1", None)),
+            // The home directory there, as scp spells it.
+            ("spark-1:~", remote("spark-1", Some("~"))),
+            ("spark-1:~/models", remote("spark-1", Some("~/models"))),
+            // An IPv6 address, bracketed so its colons are not a path's.
+            ("[fe80::1]:/srv", remote("fe80::1", Some("/srv"))),
+            ("me@[fe80::1]:models", remote("me@fe80::1", Some("models"))),
+            ("[fe80::1]", remote("fe80::1", None)),
+            ("[fe80::1]:", remote("fe80::1", None)),
+            // Local paths win: one with a colon, and a dangling link.
+            ("backup:2024", local("backup:2024")),
+            ("dangling", local("dangling")),
             (
                 "spark-1:/srv/models",
                 remote("spark-1", Some("/srv/models")),

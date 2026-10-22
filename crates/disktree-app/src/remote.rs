@@ -76,6 +76,10 @@ pub struct Remote {
     pub host: String,
     pub reach: Reach,
     pub ask: Ask,
+    /// The host was a bare word on the command line, a host only because
+    /// no local path has that name: an ssh that cannot resolve it says
+    /// so in those terms.
+    pub bare: bool,
     link: Mutex<Link>,
     /// What connecting is doing now, for the scanning screen.
     stage: Mutex<Option<String>>,
@@ -135,6 +139,7 @@ impl Remote {
             host,
             reach,
             ask,
+            bare: false,
             link: Mutex::new(Link::default()),
             stage: Mutex::new(None),
             reports: Arc::new(Mutex::new(HashMap::new())),
@@ -221,10 +226,20 @@ impl Remote {
                         }
                     });
                 })
-                .map_err(|error| format!("{host}: {error}"))?;
+                .map_err(|error| self.unreachable(&error))?;
                 Client::connect(shell.command(&serve_script(&agent, *sudo)))
                     .map_err(|error| explain(host, *sudo, &error))
             }
+        }
+    }
+
+    /// A failure to reach the host, said for what the user typed: a bare
+    /// word ssh cannot resolve was most likely a local path mistyped.
+    fn unreachable(&self, error: &str) -> String {
+        if self.bare && error.contains("Could not resolve hostname") {
+            format!("no local path or ssh host named {}", self.host)
+        } else {
+            format!("{}: {error}", self.host)
         }
     }
 
@@ -389,6 +404,16 @@ fn first_root(ask: &Ask, hello: &Hello) -> Option<PathBuf> {
             }
         }
         Ask::Disk => disk_of(&hello.mounts, &home()?),
+        // `~` and `~/x`, as scp reads them: the home directory there.
+        Ask::Path(path) if path.starts_with("~") => {
+            let rest = path.strip_prefix("~").ok()?;
+            let home = home()?;
+            if rest.as_os_str().is_empty() {
+                home
+            } else {
+                home.join(rest)
+            }
+        }
         Ask::Path(path) if path.is_relative() => home()?.join(path),
         Ask::Path(path) => path.clone(),
     })
@@ -866,7 +891,49 @@ mod tests {
             first_root(&Ask::Path("/srv".into()), &plain),
             Some(PathBuf::from("/srv"))
         );
+        assert_eq!(
+            first_root(&Ask::Path("~".into()), &plain),
+            Some(PathBuf::from("/home/me"))
+        );
+        assert_eq!(
+            first_root(&Ask::Path("~/models".into()), &plain),
+            Some(PathBuf::from("/home/me/models"))
+        );
+        assert_eq!(
+            first_root(&Ask::Path("~other/x".into()), &plain),
+            Some(PathBuf::from("/home/me/~other/x")),
+            "another user's home is not looked up"
+        );
         assert_eq!(first_root(&Ask::Default, &hello(None, &[])), None);
+    }
+
+    /// A bare word that is no local path and no host it can resolve is
+    /// said as both; `host:path` and a real failure keep ssh's words.
+    #[test]
+    fn a_bare_word_ssh_cannot_resolve_is_named_as_neither() {
+        let mut remote = Remote::new(
+            "projetcs".into(),
+            Reach::Ssh { sudo: false },
+            Ask::Default,
+        );
+        let unresolved = "ssh: Could not resolve hostname projetcs: Name or \
+                          service not known";
+        assert_eq!(remote.unreachable(unresolved), unresolved_as_typed());
+        remote.bare = true;
+        assert_eq!(
+            remote.unreachable(unresolved),
+            "no local path or ssh host named projetcs"
+        );
+        assert_eq!(
+            remote.unreachable("Permission denied (publickey)."),
+            "projetcs: Permission denied (publickey)."
+        );
+    }
+
+    fn unresolved_as_typed() -> String {
+        "projetcs: ssh: Could not resolve hostname projetcs: Name or service \
+         not known"
+            .into()
     }
 
     #[test]
