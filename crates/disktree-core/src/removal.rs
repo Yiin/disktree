@@ -662,6 +662,10 @@ struct MountTable {
     /// scanned volume from another for the meter's projection. `None` where
     /// there is none to read, and the platform's own device test answers.
     mounts: Option<Vec<crate::space::Mount>>,
+    /// Every mount with the folder of its filesystem it shows, which says
+    /// where the home trash is seen from a target's mount; see
+    /// [`trash_route`]. Empty off Linux.
+    views: Vec<crate::space::MountView>,
 }
 
 fn read_mount_table() -> MountTable {
@@ -675,6 +679,7 @@ fn read_mount_table() -> MountTable {
             media: media_roots(&views),
             run_disks: run_disks(&views),
             mounts,
+            views,
         };
     }
     MountTable {
@@ -682,6 +687,7 @@ fn read_mount_table() -> MountTable {
         media: Vec::new(),
         run_disks: Vec::new(),
         mounts,
+        views: Vec::new(),
     }
 }
 
@@ -1110,9 +1116,19 @@ pub const fn detect_trash_backend() -> TrashBackend {
 }
 
 /// Detect the best available trash backend for this machine.
+///
+/// None for root working in another user's home: `disktree HOST --sudo`
+/// runs the agent as root with the ssh user's `HOME`, and every entry it
+/// trashed would be root's, in a trash its owner cannot empty.
 #[cfg(not(any(target_os = "macos", windows)))]
 pub fn detect_trash_backend() -> TrashBackend {
-    if which("trash-put") {
+    use std::os::unix::fs::MetadataExt as _;
+    let home_owner = std::env::home_dir()
+        .and_then(|home| fs::metadata(home).ok())
+        .map(|meta| meta.uid());
+    if trash_is_someone_elses(rustix::process::geteuid().as_raw(), home_owner) {
+        TrashBackend::Unavailable
+    } else if which("trash-put") {
         TrashBackend::TrashPut
     } else if which("gio") {
         TrashBackend::Gio
@@ -1121,6 +1137,13 @@ pub fn detect_trash_backend() -> TrashBackend {
     } else {
         TrashBackend::Unavailable
     }
+}
+
+/// Whether a process running as `user` would trash into the home of
+/// `owner`, someone else, as root.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn trash_is_someone_elses(user: u32, owner: Option<u32>) -> bool {
+    user == 0 && owner.is_some_and(|owner| owner != 0)
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -1169,14 +1192,101 @@ pub enum RemovalEvent {
 pub struct RemovalHandle {
     events: Receiver<RemovalEvent>,
     cancel: Arc<AtomicBool>,
+    /// The worker, joined when its events stop without a `Done`, to say
+    /// why. `None` once joined, or when it never started.
+    worker: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
+    /// What the events so far add up to, for the `Done` a dead worker
+    /// never sent.
+    tally: std::sync::Mutex<Tally>,
+}
+
+/// The events a [`RemovalHandle`] has passed on.
+#[derive(Debug, Default)]
+struct Tally {
+    total: usize,
+    items: usize,
+    removed: u64,
+    bytes: u64,
+    failed: usize,
+    /// A `Done` has been passed on, so an ended channel is the normal end.
+    done: bool,
+    /// Events made up here for a dead worker, still to be passed on.
+    pending: std::collections::VecDeque<RemovalEvent>,
+}
+
+impl Tally {
+    fn count(&mut self, event: &RemovalEvent) {
+        match event {
+            RemovalEvent::Start { total } => self.total = *total,
+            RemovalEvent::Item { bytes, outcome, .. } => {
+                self.items += 1;
+                if outcome.is_ok() {
+                    self.removed += 1;
+                    self.bytes += bytes;
+                } else {
+                    self.failed += 1;
+                }
+            }
+            RemovalEvent::Done { .. } => self.done = true,
+        }
+    }
+
+    /// The end a worker that stopped early never sent: one failed item
+    /// saying why, then `Done`, with what it never reached counted as
+    /// failed. Every caller waits for `Done`; without it the review screen
+    /// and the agent's serve loop would wait forever.
+    fn died(&mut self, why: &str) {
+        let unreached = self.total.saturating_sub(self.items);
+        self.pending.push_back(RemovalEvent::Item {
+            path: PathBuf::new(),
+            bytes: 0,
+            outcome: Err(format!(
+                "the removal stopped before it finished ({why}); what it \
+                 had not reached was left alone"
+            )),
+        });
+        self.pending.push_back(RemovalEvent::Done {
+            removed: self.removed,
+            bytes: self.bytes,
+            failed: self.failed + unreached.max(1),
+        });
+    }
 }
 
 impl RemovalHandle {
-    /// Take the next event, if one has arrived.
+    /// Take the next event, if one has arrived. A worker that ends without
+    /// a `Done`, by a panic or otherwise, is reported as a failed item and
+    /// a `Done`; see [`Tally::died`].
     pub fn poll(&self) -> Option<RemovalEvent> {
-        // Empty and Disconnected mean the same thing to the caller: there is
-        // nothing more to do this tick.
-        self.events.try_recv().ok()
+        let mut tally = self
+            .tally
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(event) = tally.pending.pop_front() {
+            return Some(event);
+        }
+        match self.events.try_recv() {
+            Ok(event) => {
+                tally.count(&event);
+                Some(event)
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) if tally.done => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let worker = self
+                    .worker
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                let why = match worker.map(thread::JoinHandle::join) {
+                    Some(Err(panic)) => panic_message(panic.as_ref()),
+                    _ => "the worker ended without a word".to_owned(),
+                };
+                tally.died(&why);
+                tally.done = true;
+                tally.pending.pop_front()
+            }
+        }
     }
 
     /// Stop before the next target starts.
@@ -1187,7 +1297,6 @@ impl RemovalHandle {
 
 /// Start removing the plan's targets on a worker thread.
 pub fn spawn(plan: Plan, mode: RemovalMode) -> RemovalHandle {
-    let (sender, events) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
     let backend = if mode == RemovalMode::Trash {
@@ -1196,23 +1305,53 @@ pub fn spawn(plan: Plan, mode: RemovalMode) -> RemovalHandle {
         TrashBackend::Unavailable
     };
 
-    let worker = thread::Builder::new()
-        .name("disktree-remove".into())
-        .spawn({
-            let sender = sender.clone();
-            move || run(&plan, mode, backend, &worker_cancel, &sender)
-        });
-    if let Err(error) = worker {
-        let _ = sender.send(RemovalEvent::Item {
-            path: PathBuf::new(),
-            bytes: 0,
-            outcome: Err(format!(
-                "could not start the removal worker: {error}"
-            )),
-        });
-    }
+    let total = plan.targets.len();
+    start(total, cancel, move |sender| {
+        run(&plan, mode, backend, &worker_cancel, sender);
+    })
+}
 
-    RemovalHandle { events, cancel }
+/// Run `work`, a removal of `total` targets that stops when `cancel` is
+/// set, on the removal thread.
+fn start(
+    total: usize,
+    cancel: Arc<AtomicBool>,
+    work: impl FnOnce(&mpsc::Sender<RemovalEvent>) + Send + 'static,
+) -> RemovalHandle {
+    let (sender, events) = mpsc::channel();
+    let mut tally = Tally {
+        total,
+        ..Tally::default()
+    };
+    let worker = match thread::Builder::new()
+        .name("disktree-remove".into())
+        .spawn(move || work(&sender))
+    {
+        Ok(worker) => Some(worker),
+        Err(error) => {
+            tally.died(&format!("could not start the removal worker: {error}"));
+            tally.done = true;
+            None
+        }
+    };
+    RemovalHandle {
+        events,
+        cancel,
+        worker: std::sync::Mutex::new(worker),
+        tally: std::sync::Mutex::new(tally),
+    }
+}
+
+/// What a panic said, where it said it in words.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .map_or_else(
+            || "the worker panicked".to_owned(),
+            |message| format!("the worker panicked: {message}"),
+        )
 }
 
 fn run(
@@ -1268,7 +1407,9 @@ fn run(
                 RemovalMode::Permanent => {
                     remove_permanently(&target.path, &plan.root)
                 }
-                RemovalMode::Trash => move_to_trash(&target.path, backend),
+                RemovalMode::Trash => {
+                    trash_on_its_mount(&target.path, backend, &mounts.views)
+                }
             }
         };
         if outcome.is_ok() {
@@ -1591,6 +1732,133 @@ pub fn move_to_trash(path: &Path, backend: TrashBackend) -> io::Result<()> {
     }
 }
 
+/// Why a target cannot go to the trash from where it is.
+const NO_TRASH_HERE: &str =
+    "trash is not available on this disk; use permanent removal";
+
+/// Where [`trash_route`] sends a target.
+#[derive(Debug, PartialEq, Eq)]
+enum TrashRoute {
+    /// On the home trash's own mount, or no mount table to tell: the
+    /// backend as detected.
+    Usual,
+    /// The home trash, as the target's own mount shows it.
+    Through(PathBuf),
+    /// On another filesystem. Only a trash tool can take it, into the
+    /// trash it keeps at that disk's top.
+    OtherDisk,
+    /// On the home trash's filesystem, through a mount that does not show
+    /// the home trash.
+    Unreachable,
+}
+
+/// Which trash `path` goes to, given `trash`, the home trash, and `views`,
+/// this machine's mounts. Both paths have their links resolved.
+///
+/// `rename(2)` never crosses a mount, even within one filesystem. `SparkOS`
+/// mounts its root disk at `/run/sparkos/host` and binds `/home` out of it,
+/// so `/run/sparkos/host/home/u/x` and `~/.local/share/Trash` share a disk
+/// and still fail with `EXDEV`. The same trash seen through the target's own
+/// mount, `/run/sparkos/host/home/u/.local/share/Trash`, is one rename away,
+/// and what lands there is in the user's normal trash. Nothing is ever
+/// copied and deleted instead: a copy of a whole tree half done is worse
+/// than a refusal.
+fn trash_route(
+    path: &Path,
+    trash: &Path,
+    views: &[crate::space::MountView],
+) -> TrashRoute {
+    let (Some(at), Some(home)) =
+        (mount_of(path, views), mount_of(trash, views))
+    else {
+        return TrashRoute::Usual;
+    };
+    if at == home {
+        return TrashRoute::Usual;
+    }
+    let (on, home_view) = (&views[at], &views[home]);
+    if on.device != home_view.device {
+        return TrashRoute::OtherDisk;
+    }
+    // Where the trash is on the filesystem, then where the target's mount
+    // shows that, if it shows it at all.
+    let Some(through) = trash
+        .strip_prefix(&home_view.point)
+        .ok()
+        .map(|rest| home_view.fs_root.join(rest))
+        .and_then(|inside| {
+            inside
+                .strip_prefix(&on.fs_root)
+                .ok()
+                .map(|rest| on.point.join(rest))
+        })
+    else {
+        return TrashRoute::Unreachable;
+    };
+    // Something mounted on the way there would put the rename across a
+    // mount again.
+    if mount_of(&through, views) != Some(at) {
+        return TrashRoute::Unreachable;
+    }
+    TrashRoute::Through(through)
+}
+
+/// The index in `views` of the mount `path` is on: the deepest point above
+/// it, and of two at one point the later, which covers the other.
+fn mount_of(path: &Path, views: &[crate::space::MountView]) -> Option<usize> {
+    views
+        .iter()
+        .enumerate()
+        .filter(|(_, view)| path.starts_with(&view.point))
+        .max_by_key(|(_, view)| view.point.components().count())
+        .map(|(index, _)| index)
+}
+
+/// `path` with every link above it resolved, as the mount table names it;
+/// as given when that fails.
+fn resolved(path: &Path) -> PathBuf {
+    path.parent()
+        .zip(path.file_name())
+        .and_then(|(parent, name)| {
+            fs::canonicalize(parent)
+                .ok()
+                .map(|parent| parent.join(name))
+        })
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// Move one path to the trash its user looks in, through the target's own
+/// mount where the home trash is on another; see [`trash_route`]. Only the
+/// XDG backends have a home trash to route; macOS and Windows find the
+/// trash of the item's disk themselves.
+fn trash_on_its_mount(
+    path: &Path,
+    backend: TrashBackend,
+    views: &[crate::space::MountView],
+) -> io::Result<()> {
+    let trash = match backend {
+        TrashBackend::XdgHome | TrashBackend::TrashPut | TrashBackend::Gio => {
+            home_trash_dir()
+        }
+        TrashBackend::MacOs
+        | TrashBackend::RecycleBin
+        | TrashBackend::Unavailable => None,
+    };
+    let Some(trash) = trash else {
+        return move_to_trash(path, backend);
+    };
+    match trash_route(&resolved(path), &resolved(&trash), views) {
+        TrashRoute::Usual => move_to_trash(path, backend),
+        TrashRoute::Through(trash) => trash_into(path, &trash),
+        TrashRoute::OtherDisk if backend != TrashBackend::XdgHome => {
+            move_to_trash(path, backend)
+        }
+        TrashRoute::OtherDisk | TrashRoute::Unreachable => {
+            Err(io::Error::other(NO_TRASH_HERE))
+        }
+    }
+}
+
 /// Move one path to the macOS Trash.
 ///
 /// The `trash` crate resolves the parent directory and keeps the final name,
@@ -1685,9 +1953,7 @@ pub fn trash_into(path: &Path, trash: &Path) -> io::Result<()> {
     let source = fs::symlink_metadata(path)?;
     let trash_meta = fs::metadata(&files)?;
     if source.dev() != trash_meta.dev() {
-        return Err(io::Error::other(
-            "on a different filesystem than the trash; use permanent deletion",
-        ));
+        return Err(io::Error::other(NO_TRASH_HERE));
     }
 
     let name = path
@@ -2032,6 +2298,7 @@ mod tests {
             media: Vec::new(),
             run_disks: Vec::new(),
             mounts: Some(crate::space::parse_mounts(table)),
+            views: Vec::new(),
         };
         let marked = [
             target(Path::new("/home/tobi/junk"), 100),
@@ -2708,25 +2975,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_trash_tool_is_called_with_the_path_after_a_separator() {
-        use std::os::unix::fs::PermissionsExt as _;
         let temp = TempDir::new().expect("tempdir");
         let recording = temp.path().join("argv");
         let script = temp.path().join("fake-trash-put");
         fs::write(
             &script,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
-                recording.display()
-            ),
+            format!("printf '%s\\n' \"$@\" > {}\n", recording.display()),
         )
         .expect("write the script");
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
-            .expect("chmod");
 
         // A path that would be an option if the separator were missing.
         let doomed = temp.path().join("-rf");
         fs::write(&doomed, b"not this time").expect("write");
-        run_tool(&script, &[], &doomed).expect("the tool ran");
+        run_tool(&sh(), &[&script.to_string_lossy()], &doomed)
+            .expect("the tool ran");
 
         let recorded = fs::read_to_string(&recording).expect("the argv");
         let lines: Vec<&str> = recorded.lines().collect();
@@ -2737,16 +2999,187 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_failing_trash_tool_reports_its_stderr() {
-        use std::os::unix::fs::PermissionsExt as _;
         let temp = TempDir::new().expect("tempdir");
         let script = temp.path().join("angry-trash-put");
-        fs::write(&script, "#!/bin/sh\necho 'no trash here' >&2\nexit 3\n")
+        fs::write(&script, "echo 'no trash here' >&2\nexit 3\n")
             .expect("write");
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
-            .expect("chmod");
 
-        let error = run_tool(&script, &[], temp.path()).expect_err("it failed");
+        let error = run_tool(&sh(), &[&script.to_string_lossy()], temp.path())
+            .expect_err("it failed");
         assert!(error.to_string().contains("no trash here"), "{error}");
+    }
+
+    /// The shell the fake trash tools run in. Executing a script the test
+    /// just wrote fails now and then with `ETXTBSY`: another test thread
+    /// forking at that moment holds the write descriptor open until its
+    /// child execs. The shell only reads the script, so it cannot.
+    #[cfg(unix)]
+    fn sh() -> PathBuf {
+        PathBuf::from("/bin/sh")
+    }
+
+    /// `SparkOS`: the root disk at /run/sparkos/host, `/home` bound out of
+    /// it, and another disk under the root.
+    #[cfg(target_os = "linux")]
+    fn spark_mounts() -> Vec<crate::space::MountView> {
+        crate::space::parse_mountinfo(
+            "33 39 0:29 / /run rw - tmpfs tmpfs rw\n\
+             34 33 259:2 / /run/sparkos/host rw - ext4 /dev/nvme0n1p2 rw\n\
+             39 2 0:31 / / rw - overlay overlay rw\n\
+             59 39 259:2 /home /home rw - ext4 /dev/nvme0n1p2 rw\n\
+             63 39 259:2 /srv /srv rw - ext4 /dev/nvme0n1p2 rw\n\
+             70 34 259:5 / /run/sparkos/host/data rw - ext4 /dev/nvme1n1 rw\n\
+             71 34 0:40 / /run/sparkos/host/home/me/.local rw - tmpfs \
+             tmpfs rw\n",
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_target_is_trashed_through_its_own_mount() {
+        let mut views = spark_mounts();
+        // Without the tmpfs over ~/.local seen from the host disk.
+        views.pop();
+        let trash = Path::new("/home/me/.local/share/Trash");
+        let route = |path: &str| trash_route(Path::new(path), trash, &views);
+        assert_eq!(
+            route("/run/sparkos/host/home/me/models/big.gguf"),
+            TrashRoute::Through(PathBuf::from(
+                "/run/sparkos/host/home/me/.local/share/Trash"
+            )),
+            "the same trash, one rename away"
+        );
+        assert_eq!(
+            route("/run/sparkos/host/srv/data"),
+            TrashRoute::Through(PathBuf::from(
+                "/run/sparkos/host/home/me/.local/share/Trash"
+            )),
+            "anything on the host disk"
+        );
+        assert_eq!(route("/home/me/models/big.gguf"), TrashRoute::Usual);
+        assert_eq!(
+            route("/srv/data"),
+            TrashRoute::Unreachable,
+            "/srv shows no home"
+        );
+        assert_eq!(route("/run/sparkos/host/data/x"), TrashRoute::OtherDisk);
+        assert_eq!(
+            trash_route(Path::new("/srv/x"), trash, &[]),
+            TrashRoute::Usual,
+            "no mount table, nothing to route"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_mount_on_the_way_to_the_trash_makes_it_unreachable() {
+        let views = spark_mounts();
+        assert_eq!(
+            trash_route(
+                Path::new("/run/sparkos/host/srv/data"),
+                Path::new("/home/me/.local/share/Trash"),
+                &views,
+            ),
+            TrashRoute::Unreachable,
+            "the tmpfs over .local would put the rename across a mount"
+        );
+    }
+
+    /// The route and the rename together, on one filesystem: a disk at
+    /// `host`, and `home` bound out of it at another spelling.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_routed_target_lands_in_the_users_trash_with_its_marked_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let host = temp.path().join("host");
+        fs::create_dir_all(host.join("home/me/models")).expect("mkdir");
+        let doomed = host.join("home/me/models/big.gguf");
+        fs::write(&doomed, b"weights").expect("write");
+        let line = |id: u32, root: &str, point: &Path| {
+            format!("{id} 1 8:1 {root} {} rw - ext4 /dev/sda1 rw\n", {
+                point.display()
+            })
+        };
+        let bound = temp.path().join("bound-home");
+        let views = crate::space::parse_mountinfo(
+            &(line(1, "/", &host) + &line(2, "/home", &bound)),
+        );
+
+        let route =
+            trash_route(&doomed, &bound.join("me/.local/share/Trash"), &views);
+        let TrashRoute::Through(trash) = route else {
+            panic!("expected a route, got {route:?}");
+        };
+        assert_eq!(trash, host.join("home/me/.local/share/Trash"));
+        trash_into(&doomed, &trash).expect("trashed");
+
+        assert!(!doomed.exists());
+        assert_eq!(
+            fs::read(trash.join("files/big.gguf")).expect("in the trash"),
+            b"weights"
+        );
+        let info = fs::read_to_string(trash.join("info/big.gguf.trashinfo"))
+            .expect("info file");
+        let recorded = info
+            .lines()
+            .find_map(|line| line.strip_prefix("Path="))
+            .expect("a path");
+        assert_eq!(recorded, percent_encode(&doomed.to_string_lossy()));
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    fn root_never_trashes_into_another_users_home() {
+        assert!(trash_is_someone_elses(0, Some(1000)), "--sudo");
+        assert!(!trash_is_someone_elses(0, Some(0)), "root's own home");
+        assert!(!trash_is_someone_elses(1000, Some(1000)));
+        assert!(!trash_is_someone_elses(0, None), "no home, no trash anyway");
+    }
+
+    /// Every events loop waits for `Done`; a worker that dies must still
+    /// end with one.
+    #[test]
+    fn a_worker_that_dies_is_reported_and_ends_the_run() {
+        let handle = start(3, Arc::new(AtomicBool::new(false)), |sender| {
+            let _ = sender.send(RemovalEvent::Start { total: 3 });
+            let _ = sender.send(RemovalEvent::Item {
+                path: PathBuf::from("/x/first"),
+                bytes: 7,
+                outcome: Ok(()),
+            });
+            panic!("out of luck");
+        });
+        let mut events = Vec::new();
+        for _ in 0..2000 {
+            while let Some(event) = handle.poll() {
+                events.push(event);
+            }
+            if matches!(events.last(), Some(RemovalEvent::Done { .. })) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        assert_eq!(events.len(), 4, "{events:?}");
+        match &events[2] {
+            RemovalEvent::Item {
+                outcome: Err(message),
+                ..
+            } => assert!(message.contains("out of luck"), "{message}"),
+            other => panic!("expected the failure, got {other:?}"),
+        }
+        match events[3] {
+            RemovalEvent::Done {
+                removed,
+                bytes,
+                failed,
+            } => {
+                assert_eq!((removed, bytes), (1, 7), "what was done stands");
+                assert_eq!(failed, 2, "what it never reached failed");
+            }
+            ref other => panic!("expected Done, got {other:?}"),
+        }
+        assert!(handle.poll().is_none(), "and nothing after it");
     }
 
     #[cfg(not(windows))]
