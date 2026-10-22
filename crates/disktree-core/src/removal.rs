@@ -215,21 +215,50 @@ fn plan_judged(
 
     // A path inside another target is removed with it. Keep the outer one and
     // report the inner one so the review screen can explain the nesting.
-    accepted.sort_by(|left, right| left.path.cmp(&right.path));
+    //
+    // Sorted by guard key, every path inside an accepted one forms one run
+    // directly after it, so the only path that can contain the one being
+    // judged is the last accepted one. Comparing each target with every outer
+    // one instead took forty seconds for twenty thousand marks, with two
+    // guard keys per comparison, and the review screen plans on every frame.
+    #[cfg(test)]
+    let before_nesting = accepted.clone();
+    let mut keyed: Vec<(PathBuf, Target)> = accepted
+        .into_iter()
+        .map(|target| (guard_key(&target.path), target))
+        .collect();
+    keyed.sort_by(|(left_key, left), (right_key, right)| {
+        left_key
+            .cmp(right_key)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let mut accepting: Option<PathBuf> = None;
     let mut outer: Vec<Target> = Vec::new();
-    for target in accepted {
+    let mut nested: Vec<Target> = Vec::new();
+    for (key, target) in keyed {
         if stop.load(Ordering::Relaxed) {
             return None;
         }
-        if outer
-            .iter()
-            .any(|candidate| within(&target.path, &candidate.path))
-        {
-            plan.covered.push(target);
+        if accepting.as_ref().is_some_and(|top| key.starts_with(top)) {
+            nested.push(target);
         } else {
+            accepting = Some(key);
             outer.push(target);
         }
     }
+    // Listed in path order, as the marks are, whatever order the keys sort
+    // in on a platform that folds spellings.
+    outer.sort_by(|left, right| left.path.cmp(&right.path));
+    nested.sort_by(|left, right| left.path.cmp(&right.path));
+    // Every plan test, and the random mark sets below, compare this rule with
+    // the one it replaced; see `nest_as_before`.
+    #[cfg(test)]
+    {
+        let (before_outer, before_nested) = nest_as_before(&before_nesting);
+        assert_eq!(outer, before_outer, "the nesting rule changed");
+        assert_eq!(nested, before_nested, "the nesting rule changed");
+    }
+    plan.covered = nested;
     plan.targets = outer;
 
     // Which volume each target's bytes come back to. Only what comes back to
@@ -331,9 +360,34 @@ fn windows_key(path: &Path) -> PathBuf {
 }
 
 /// `path` is `base` or inside it, by whole components, as the guards
-/// compare them.
+/// compare them. Only the tests compare that way now, against the nesting
+/// rule kept for them; the plan itself compares sorted keys.
+#[cfg(test)]
 fn within(path: &Path, base: &Path) -> bool {
     guard_key(path).starts_with(guard_key(base))
+}
+
+/// The nesting rule [`plan_judged`] used before it was sorted: each accepted
+/// path compared with every outer one, in path order. Kept only so the tests
+/// can show the sorted rule keeps every outcome, including the order the
+/// lists come out in.
+#[cfg(test)]
+fn nest_as_before(accepted: &[Target]) -> (Vec<Target>, Vec<Target>) {
+    let mut accepted = accepted.to_vec();
+    accepted.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut outer: Vec<Target> = Vec::new();
+    let mut covered: Vec<Target> = Vec::new();
+    for target in accepted {
+        if outer
+            .iter()
+            .any(|candidate| within(&target.path, &candidate.path))
+        {
+            covered.push(target);
+        } else {
+            outer.push(target);
+        }
+    }
+    (outer, covered)
 }
 
 /// The system trees with their guard keys, computed once: the review screen
@@ -2767,6 +2821,86 @@ mod tests {
         );
     }
 
+    /// One mount table, as a `SparkOS` machine reports it: the root disk
+    /// mounted whole under `/run`, the loop device the running image is
+    /// read from on it, and the swap file on it. Every part of the guards is
+    /// read from that one table, and `refuse_judged` names the image and the
+    /// swap file before the `/run` rule refuses the rest.
+    ///
+    /// The paths are the fixture's, and nothing under `/run` here is real:
+    /// the `/run` exceptions canonicalize, so they cannot be asked for, and
+    /// what may still go on that disk is proved where `on_run_disk` is asked
+    /// directly. This proves the two files are in one table and are refused
+    /// by what they are, not by where they sit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_sparkos_table_pins_its_boot_image_and_its_swap_file() {
+        let views = crate::space::parse_mountinfo(
+            "33 39 0:29 / /run rw - tmpfs tmpfs rw\n\
+             34 33 259:2 / /run/sparkos/host rw - ext4 /dev/nvme0n1p2 rw\n\
+             35 33 7:0 / /run/sparkos/lower ro - erofs /dev/loop0 ro\n\
+             39 2 0:31 / / rw - overlay overlay rw\n\
+             59 39 259:2 /home /home rw - ext4 /dev/nvme0n1p2 rw\n\
+             63 39 259:2 /srv /srv rw - ext4 /dev/nvme0n1p2 rw\n",
+        );
+        let image = "/run/sparkos/host/images/spark-os-0.9.5.erofs";
+        let swap = "/run/sparkos/host/swap.img";
+        let loops = [("/dev/loop0".to_owned(), format!("{image}\n"))];
+        let swaps = format!(
+            "Filename\tType\tSize\tUsed\tPriority\n\
+             {swap} file 16777212 0 -2\n\
+             /dev/nvme0n1p3 partition 8388604 0 -3\n"
+        );
+        // No mount source here is a plain file: the kernel names the loop
+        // image and the swap file in their own tables.
+        let pinned = pinned_files(&loops, &swaps, &views, |_| false);
+        let named: Vec<&Path> =
+            pinned.iter().map(|file| file.path.as_path()).collect();
+        assert_eq!(named, [Path::new(image), Path::new(swap)]);
+        let disks = run_disks(&views);
+        assert_eq!(disks.len(), 1, "{disks:?}");
+        assert!(disks[0].sparkos, "the disk `SparkOS` runs from");
+
+        let points: Vec<PathBuf> =
+            views.iter().map(|view| guard_key(&view.point)).collect();
+        let media = media_roots(&views);
+        let homes = [Home::of(Path::new("/run/sparkos/host/home/me"))];
+        let judge = |path: &str| {
+            refuse_judged(
+                Path::new(path),
+                Path::new("/"),
+                &homes,
+                &points,
+                &media,
+                &disks,
+                &pinned,
+            )
+        };
+
+        let booted = judge(image).expect("the boot image");
+        assert!(booted.contains("boots from"), "{booted}");
+        assert!(
+            booted.contains("/dev/loop0 at /run/sparkos/lower"),
+            "{booted}"
+        );
+        let paged = judge(swap).expect("the swap file");
+        assert!(paged.contains("active swap"), "{paged}");
+        assert!(paged.contains("pages to this file"), "{paged}");
+        for holder in ["/run/sparkos/host/images", "/run/sparkos/host"] {
+            let why = judge(holder).expect("a folder holding one");
+            assert!(why.starts_with("it holds "), "{holder}: {why}");
+        }
+        // The folder holding the image names the image, not the swap file:
+        // the guard says which file, not just that one is near.
+        let images = judge("/run/sparkos/host/images").expect("images");
+        assert!(images.contains("spark-os-0.9.5.erofs"), "{images}");
+        // What is not pinned there is still refused as part of `/run`; a
+        // real boot proves the disk's own exception, not this fixture.
+        let rest =
+            judge("/run/sparkos/host/images/old.erofs").expect("part of /run");
+        assert!(rest.contains("part of the system under /run"), "{rest}");
+    }
+
     /// Under `sudo` with the caller's `HOME`, root's home is protected as
     /// well as the caller's: both, not one or the other.
     #[test]
@@ -2914,6 +3048,81 @@ mod tests {
         assert_eq!(plan.covered.len(), 1);
         assert_eq!(plan.covered[0].path, inner.path);
         assert_eq!(plan.bytes(), 30);
+    }
+
+    /// A few thousand random mark sets over one generated tree: nested
+    /// marks, repeats of one mark, and marks outside the root. Each one is
+    /// planned, and `plan_judged` compares the nesting answer it gives with
+    /// the rule it replaced (`nest_as_before`), so a set whose answer
+    /// changed fails here. The seed is fixed: the sets are the same every
+    /// run.
+    #[test]
+    fn random_mark_sets_keep_the_nesting_answer() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        let mut paths: Vec<PathBuf> = vec![root.to_path_buf()];
+        for top in 0..6 {
+            let top = root.join(format!("d{top}"));
+            fs::create_dir(&top).expect("top");
+            paths.push(top.clone());
+            for sub in 0..4 {
+                let sub = top.join(format!("s{sub}"));
+                fs::create_dir(&sub).expect("sub");
+                paths.push(sub.clone());
+                for file in 0..5 {
+                    let file = sub.join(format!("f{file}"));
+                    fs::write(&file, b"x").expect("file");
+                    paths.push(file);
+                }
+            }
+        }
+        paths.push(PathBuf::from("/disktree-pol1-outside/x"));
+        // Not normalized: the plan normalizes it before comparing.
+        paths.push(root.join("d0/s1/f0/../f1"));
+
+        // xorshift64: no dependency, and the same sets every run.
+        let mut state = 0x5eed_1234_9abc_def1_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..3_000 {
+            let count = 1 + (next() % 24) as usize;
+            let marks: Vec<Target> = (0..count)
+                .map(|_| {
+                    let path = &paths[(next() as usize) % paths.len()];
+                    target(path, next() % 1_000)
+                })
+                .collect();
+            let plan = plan_against(&marks, root, &MountTable::default());
+            assert_eq!(
+                plan.targets.len() + plan.covered.len() + plan.blocked.len(),
+                marks.len(),
+                "a mark went missing"
+            );
+            for (index, left) in plan.targets.iter().enumerate() {
+                for right in &plan.targets[index + 1..] {
+                    assert!(
+                        !within(&left.path, &right.path)
+                            && !within(&right.path, &left.path),
+                        "{} and {} nest",
+                        left.path.display(),
+                        right.path.display()
+                    );
+                }
+            }
+            for covered in &plan.covered {
+                assert!(
+                    plan.targets
+                        .iter()
+                        .any(|outer| within(&covered.path, &outer.path)),
+                    "{} is covered by nothing",
+                    covered.path.display()
+                );
+            }
+        }
     }
 
     /// Marks may sit on another volume — `-X` crosses filesystems, and a
