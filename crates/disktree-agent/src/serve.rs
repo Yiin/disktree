@@ -584,6 +584,18 @@ mod tests {
         }
     }
 
+    /// Wait until the agent has written its whole hello. A test that
+    /// breaks or stalls the output any sooner catches the hello instead
+    /// of the request it means to: broken mid-hello, the agent ends
+    /// before it reads one.
+    fn wait_for_hello(written: &Captured) {
+        let mut hello_bytes = preamble();
+        write_frame(&mut hello_bytes, tag::HELLO, &hello().encode()).unwrap();
+        while lock(&written.0).len() < hello_bytes.len() {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// `count` directories of `files` small files each, under `root`.
     fn directories(root: &Path, count: usize, files: usize) -> Vec<Target> {
         (0..count)
@@ -657,9 +669,7 @@ mod tests {
             let output = output.clone();
             move || serve(reader, output)
         });
-        while lock(&output.written.0).is_empty() {
-            thread::sleep(Duration::from_millis(1));
-        }
+        wait_for_hello(&output.written);
         output.broken.store(true, Ordering::Relaxed);
         writer
             .write_all(&remove_frame(&real(&temp), &targets))
@@ -769,9 +779,7 @@ mod tests {
             let output = output.clone();
             move || serve_until_silent(reader, output, silence)
         });
-        while lock(&output.written.0).is_empty() {
-            thread::sleep(Duration::from_millis(1));
-        }
+        wait_for_hello(&output.written);
         output.stalled.store(true, Ordering::Relaxed);
         let scan = Request::Scan {
             root: temp.path().to_path_buf(),
