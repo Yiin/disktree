@@ -382,7 +382,9 @@ it.
 
 On connecting, disktree copies the agent for the host's architecture to
 `~/.cache/disktree/agent-<hash>` there if it is missing, and removes the
-agents older releases left in that folder. The agents are static Linux
+agents in that folder nobody started for a week, so two disktree builds
+that reach one host keep each other's. The install runs in `sh` whatever
+the login shell is there. The agents are static Linux
 binaries for aarch64 and x86_64, and the app carries them:
 `make install` builds them first (`make agent`), which needs rustup with
 both musl targets (`rustup target add aarch64-unknown-linux-musl

@@ -216,7 +216,7 @@ impl Remote {
             Reach::Ssh { sudo } => {
                 let shell = Shell::Ssh { host: host.clone() };
                 self.set_stage(format!("Connecting to {host}"));
-                let agent = install(&shell, embedded, |stage| {
+                connect_installed(&shell, embedded, *sudo, |stage| {
                     self.set_stage(match stage {
                         Stage::Installing => {
                             format!("Installing the agent on {host}")
@@ -226,9 +226,10 @@ impl Remote {
                         }
                     });
                 })
-                .map_err(|error| self.unreachable(&error))?;
-                Client::connect(shell.command(&serve_script(&agent, *sudo)))
-                    .map_err(|error| explain(host, *sudo, &error))
+                .map_err(|failure| match failure {
+                    Failure::Install(error) => self.unreachable(&error),
+                    Failure::Start(error) => explain(host, *sudo, &error),
+                })
             }
         }
     }
@@ -513,6 +514,23 @@ impl Shell {
         }
     }
 
+    /// Run `script`, any number of lines, with `payload` on its stdin
+    /// after it. The command line only reads the script, exactly, with
+    /// `dd`, and hands it to `sh`: a login shell such as csh cannot take a
+    /// quoted word over several lines, and `sh -s` is no way round it,
+    /// since busybox's reads ahead into the payload.
+    fn run_script(
+        &self,
+        script: &str,
+        payload: &[u8],
+    ) -> Result<String, String> {
+        let reader =
+            format!("eval \"$(dd bs=1 count={} 2>/dev/null)\"", script.len());
+        let mut input = script.as_bytes().to_vec();
+        input.extend_from_slice(payload);
+        self.run(&reader, &input)
+    }
+
     /// Run `script` with `input` on its stdin, and return its stdout.
     fn run(&self, script: &str, input: &[u8]) -> Result<String, String> {
         let mut child = self
@@ -589,17 +607,23 @@ pub fn agent_name(agent: &[u8]) -> String {
 #[derive(Debug, PartialEq, Eq)]
 struct Probe {
     arch: String,
-    /// The files in the agent folder.
+    /// The agents in the agent folder.
     present: Vec<String>,
 }
 
-/// One round trip: the machine, and which agents it has.
-const PROBE: &str = "uname -m; ls -1 \"$HOME/.cache/disktree\" 2>/dev/null; \
-                     exit 0";
+/// One round trip: the machine, and which agents it has. Each answer is
+/// on a line of its own with a mark, so whatever else a login shell
+/// prints is passed over.
+const PROBE: &str = "echo \"arch=$(uname -m)\"; for f in \
+                     \"$HOME/.cache/disktree\"/agent-*; do \
+                     echo \"have=${f##*/}\"; done; exit 0";
 
 fn parse_probe(output: &str) -> Option<Probe> {
-    let mut lines = output.lines();
-    let arch = match lines.next()?.trim() {
+    let arch = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("arch="))
+        .next_back()?;
+    let arch = match arch.trim() {
         // macOS and some BSDs say arm64; Debian's tools say amd64.
         "arm64" => "aarch64",
         "amd64" => "x86_64",
@@ -608,21 +632,75 @@ fn parse_probe(output: &str) -> Option<Probe> {
     .to_owned();
     Some(Probe {
         arch,
-        present: lines.map(str::to_owned).collect(),
+        present: output
+            .lines()
+            .filter_map(|line| line.strip_prefix("have="))
+            .map(str::to_owned)
+            .collect(),
     })
+}
+
+/// Why connecting failed: on the way to the agent, or starting it.
+#[derive(Debug)]
+pub enum Failure {
+    Install(String),
+    Start(io::Error),
+}
+
+/// Install the agent if it is missing, and start it, under `sudo -n` when
+/// asked. An agent the probe saw but that is gone when it is started,
+/// which another disktree's cleanup can do, is installed again, once.
+pub fn connect_installed(
+    shell: &Shell,
+    agents: impl Fn(&str) -> Option<&'static [u8]>,
+    sudo: bool,
+    mut stage: impl FnMut(Stage),
+) -> Result<Client, Failure> {
+    let agent = install_with(shell, &agents, false, &mut stage)
+        .map_err(Failure::Install)?;
+    match Client::connect(shell.command(&serve_script(&agent, sudo))) {
+        Err(error) if vanished(&error, &agent) => {
+            let agent = install_with(shell, &agents, true, &mut stage)
+                .map_err(Failure::Install)?;
+            Client::connect(shell.command(&serve_script(&agent, sudo)))
+                .map_err(Failure::Start)
+        }
+        connected => connected.map_err(Failure::Start),
+    }
+}
+
+/// Whether starting `agent` failed because it is not there.
+fn vanished(error: &io::Error, agent: &str) -> bool {
+    let message = error.to_string();
+    let name = agent.rsplit('/').next().unwrap_or(agent);
+    message.contains(name)
+        && (message.contains("not found") || message.contains("No such file"))
 }
 
 /// Make sure the agent for the host's architecture is in
 /// `~/.cache/disktree` there, and return its path relative to the home
-/// directory. Copies it only when missing; a copy replaces every other
-/// `agent-*` file in that folder, which earlier releases left there.
+/// directory. Copies it only when missing.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "connect_installed calls install_with")
+)]
 pub fn install(
     shell: &Shell,
     agents: impl Fn(&str) -> Option<&'static [u8]>,
     mut stage: impl FnMut(Stage),
 ) -> Result<String, String> {
+    install_with(shell, &agents, false, &mut stage)
+}
+
+/// [`install`], copying the agent even when the probe saw it when `again`.
+fn install_with(
+    shell: &Shell,
+    agents: &impl Fn(&str) -> Option<&'static [u8]>,
+    again: bool,
+    stage: &mut impl FnMut(Stage),
+) -> Result<String, String> {
     let probe = parse_probe(&shell.run(PROBE, &[])?)
-        .ok_or("the probe there printed nothing")?;
+        .ok_or("the probe there did not say what machine it is")?;
     let agent = agents(&probe.arch).ok_or_else(|| {
         format!(
             "this disktree carries no agent for {}: run `make agent`, then \
@@ -631,26 +709,34 @@ pub fn install(
         )
     })?;
     let name = agent_name(agent);
-    if !probe.present.contains(&name) {
+    if again || !probe.present.contains(&name) {
         stage(Stage::Installing);
-        shell.run(&install_script(&name, agent.len()), agent)?;
+        shell.run_script(&install_script(&name, agent.len()), agent)?;
     }
     stage(Stage::Starting);
     Ok(format!("{AGENT_DIR}/{name}"))
 }
 
+/// How long an agent nobody started stays. Each start touches the agent,
+/// so this is the time since it was last used: two builds on two
+/// machines that connect to one host keep each other's agents.
+const STALE_DAYS: u32 = 7;
+
 /// Read the agent from stdin into a temporary name, check its length,
 /// make it executable and move it into place in one step, so a cut
 /// connection never leaves a half agent under the real name. Then remove
-/// the other agents: plain files named `agent-*` in that folder, nothing
-/// else.
+/// the agents nobody started for [`STALE_DAYS`]: plain files named
+/// `agent-*` in that folder, nothing else. A cleanup that fails costs
+/// nothing; the agent is already in place.
 fn install_script(name: &str, length: usize) -> String {
+    // `-mtime +N` counts whole days past N.
+    let stale = STALE_DAYS - 1;
     format!(
         "set -e
 dir=\"$HOME/{AGENT_DIR}\"
 mkdir -p \"$dir\"
 part=\"$dir/.{name}.$$\"
-trap \"rm -f \\\"$part\\\"\" EXIT
+trap 'rm -f \"$part\"' EXIT
 cat > \"$part\"
 size=$(wc -c < \"$part\")
 if [ \"$size\" -ne {length} ]; then
@@ -659,11 +745,8 @@ if [ \"$size\" -ne {length} ]; then
 fi
 chmod 755 \"$part\"
 mv -f \"$part\" \"$dir/{name}\"
-for old in \"$dir\"/agent-*; do
-  if [ \"$old\" != \"$dir/{name}\" ] && [ -f \"$old\" ] && [ ! -L \"$old\" ]; then
-    rm -f \"$old\"
-  fi
-done
+find \"$dir\" -maxdepth 1 -type f -name 'agent-*' ! -name '{name}' \\
+  -mtime +{stale} -exec rm -f {{}} \\; 2>/dev/null || true
 "
     )
 }
@@ -686,10 +769,13 @@ const fn trash_offered(reach: &Reach, hello: Option<&Hello>) -> TrashBackend {
 /// directory, and root's would leave the user's unguarded.
 fn serve_script(agent: &str, sudo: bool) -> String {
     let agent = format!("\"$HOME/{agent}\"");
+    // Touched first, without creating it: the cleanup goes by when an
+    // agent was last started.
+    let touch = format!("touch -c {agent} 2>/dev/null;");
     if sudo {
-        format!("exec sudo -n env HOME=\"$HOME\" {agent} serve")
+        format!("{touch} exec sudo -n env HOME=\"$HOME\" {agent} serve")
     } else {
-        format!("exec {agent} serve")
+        format!("{touch} exec {agent} serve")
     }
 }
 
@@ -720,7 +806,22 @@ mod tests {
         let home = tempfile::tempdir().expect("home");
         let dir = home.path().join(AGENT_DIR);
         std::fs::create_dir_all(dir.join("agent-folder")).expect("folders");
-        std::fs::write(dir.join("agent-0123456789abcdef"), "old").expect("old");
+        // One nobody started for ten days, and one another build started
+        // today: only the first goes.
+        let stale = dir.join("agent-0123456789abcdef");
+        std::fs::write(&stale, "old").expect("old");
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .and_then(|file| {
+                file.set_modified(
+                    std::time::SystemTime::now()
+                        - Duration::from_hours(10 * 24),
+                )
+            })
+            .expect("age it");
+        std::fs::write(dir.join("agent-fedcba9876543210"), "in use")
+            .expect("in use");
         std::fs::write(dir.join("notes.txt"), "keep").expect("notes");
         std::os::unix::fs::symlink(
             home.path().join("elsewhere"),
@@ -739,7 +840,11 @@ mod tests {
         assert_eq!(std::fs::read(&installed).expect("installed"), FAKE);
         let mode = std::fs::metadata(&installed).expect("mode").permissions();
         assert_eq!(mode.mode() & 0o777, 0o755);
-        assert!(!dir.join("agent-0123456789abcdef").exists(), "stale agent");
+        assert!(!stale.exists(), "stale agent");
+        assert!(
+            dir.join("agent-fedcba9876543210").exists(),
+            "another build's agent, started within the week"
+        );
         assert!(dir.join("notes.txt").exists(), "not an agent");
         assert!(dir.join("agent-folder").is_dir(), "not a file");
         assert!(dir.join("agent-link").symlink_metadata().is_ok(), "a link");
@@ -796,23 +901,99 @@ mod tests {
 
     #[test]
     fn the_probe_names_the_architecture_the_way_the_agents_are_built() {
-        let probe = parse_probe("arm64\nagent-00\nnotes\n").expect("probe");
+        // A login shell that talks: its lines are passed over.
+        let probe = parse_probe(
+            "Welcome!\narch=arm64\nhave=agent-00\nhave=agent-*\nbye\n",
+        )
+        .expect("probe");
         assert_eq!(probe.arch, "aarch64");
-        assert_eq!(probe.present, ["agent-00", "notes"]);
-        assert_eq!(parse_probe("amd64\n").expect("probe").arch, "x86_64");
+        assert_eq!(probe.present, ["agent-00", "agent-*"]);
+        assert_eq!(parse_probe("arch=amd64\n").expect("probe").arch, "x86_64");
+        assert_eq!(parse_probe("x86_64\n"), None, "unmarked");
         assert_eq!(parse_probe(""), None);
+
+        let home = tempfile::tempdir().expect("home");
+        let shell = Shell::Local {
+            home: home.path().to_path_buf(),
+        };
+        let probe = parse_probe(&shell.run(PROBE, &[]).expect("probe"))
+            .expect("parsed");
+        assert!(!probe.arch.is_empty());
+        assert_eq!(probe.present, ["agent-*"], "an empty folder's glob");
+    }
+
+    /// A script of many lines, with quotes of both kinds, reaches `sh`
+    /// whole, and its payload after it byte for byte.
+    #[test]
+    fn a_script_and_its_payload_arrive_apart() {
+        let home = tempfile::tempdir().expect("home");
+        let shell = Shell::Local {
+            home: home.path().to_path_buf(),
+        };
+        let payload: Vec<u8> = (0..=255).cycle().take(300_000).collect();
+        let script = "set -e\nsaid='it''s'\necho \"$said\"\n\
+                      cat > \"$HOME/payload\"\nwc -c < \"$HOME/payload\"\n";
+        let output = shell.run_script(script, &payload).expect("ran");
+        assert_eq!(
+            output.split_whitespace().collect::<Vec<_>>(),
+            ["its", "300000"]
+        );
+        assert_eq!(
+            std::fs::read(home.path().join("payload")).expect("payload"),
+            payload
+        );
+    }
+
+    /// The agent the probe saw is gone when it is started, as when
+    /// another build's cleanup took it: it is installed again, once, and
+    /// started.
+    #[test]
+    fn an_agent_that_vanished_is_installed_again_once() {
+        let built = std::env::current_exe()
+            .ok()
+            .and_then(|exe| {
+                Some(exe.parent()?.parent()?.join("disktree-agent"))
+            })
+            .filter(|agent| agent.is_file())
+            .expect("build the agent first: cargo build -p disktree-agent");
+        let real: &'static [u8] =
+            Box::leak(std::fs::read(built).expect("agent").into_boxed_slice());
+        let agents =
+            |arch: &str| (arch == std::env::consts::ARCH).then_some(real);
+        let home = tempfile::tempdir().expect("home");
+        let dir = home.path().join(AGENT_DIR);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::os::unix::fs::symlink(
+            home.path().join("gone"),
+            dir.join(agent_name(real)),
+        )
+        .expect("a name with nothing behind it");
+        let shell = Shell::Local {
+            home: home.path().to_path_buf(),
+        };
+        let mut seen = Vec::new();
+        let client =
+            connect_installed(&shell, agents, false, |stage| seen.push(stage))
+                .expect("connected after installing again");
+        assert_eq!(seen, [Stage::Starting, Stage::Installing, Stage::Starting]);
+        assert_eq!(client.hello().protocol, disktree_agent::PROTOCOL);
+        let installed = dir.join(agent_name(real));
+        assert!(installed.symlink_metadata().expect("there").is_file());
     }
 
     #[test]
     fn the_agent_runs_as_the_ssh_user_or_under_sudo_with_their_home() {
+        let touch = "touch -c \"$HOME/.cache/disktree/agent-ab\" 2>/dev/null;";
         assert_eq!(
             serve_script(".cache/disktree/agent-ab", false),
-            "exec \"$HOME/.cache/disktree/agent-ab\" serve"
+            format!("{touch} exec \"$HOME/.cache/disktree/agent-ab\" serve")
         );
         assert_eq!(
             serve_script(".cache/disktree/agent-ab", true),
-            "exec sudo -n env HOME=\"$HOME\" \
-             \"$HOME/.cache/disktree/agent-ab\" serve"
+            format!(
+                "{touch} exec sudo -n env HOME=\"$HOME\" \
+                 \"$HOME/.cache/disktree/agent-ab\" serve"
+            )
         );
         let error = io::Error::other("sudo: a password is required");
         assert!(explain("spark-1", true, &error).contains("never prompts"));
