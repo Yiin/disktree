@@ -1721,13 +1721,24 @@ fn run(
     let _ = sender.send(RemovalEvent::Start {
         total: plan.targets.len(),
     });
-    let mut removed = 0_u64;
-    let mut bytes = 0_u64;
-    let mut failed = 0_usize;
     // The plan was judged against a mount table up to `MOUNTS_FRESH` old,
     // or, right after start, not read yet. Judged again against a fresh
     // read, here on the worker, before anything is touched.
-    let mounts = read_mount_table();
+    run_against(plan, mode, backend, cancel, sender, &read_mount_table());
+}
+
+/// [`run`] after its start, judged again against `mounts`.
+fn run_against(
+    plan: &Plan,
+    mode: RemovalMode,
+    backend: TrashBackend,
+    cancel: &AtomicBool,
+    sender: &mpsc::Sender<RemovalEvent>,
+    mounts: &MountTable,
+) {
+    let mut removed = 0_u64;
+    let mut bytes = 0_u64;
+    let mut failed = 0_usize;
     // Links too: one put on the way down since the plan was made would lead
     // the trash out of the root. Permanent removal on Unix refuses that by
     // itself; see [`open_parent`].
@@ -1746,7 +1757,7 @@ fn run(
         let reason = target
             .path
             .starts_with("/run")
-            .then(|| refuse_with(&target.path, &plan.root, &homes, &mounts))
+            .then(|| refuse_with(&target.path, &plan.root, &homes, mounts))
             .flatten()
             .or_else(|| {
                 pinned_by(
@@ -3385,6 +3396,63 @@ mod tests {
         let error = outcome.expect("an item").expect_err("refused");
         assert!(error.contains("through a link"), "{error}");
         assert!(keep.path().join("x/precious.bin").exists());
+    }
+
+    /// A swap file turned on after the review was planned: the worker
+    /// judges every target again against what the system runs from now,
+    /// refuses the one that holds it, and removes the rest.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_pinned_after_planning_is_refused_by_the_worker() {
+        let temp = tree();
+        let holder = temp.path().join("a/swapdir");
+        fs::create_dir_all(&holder).expect("mkdir");
+        let swap = holder.join("swap.img");
+        fs::write(&swap, b"x").expect("swap");
+        let free = temp.path().join("a/free.bin");
+        fs::write(&free, b"x").expect("free");
+        let plan = plan_against(
+            &[target(&holder, 1), target(&free, 1)],
+            temp.path(),
+            &MountTable::default(),
+        );
+        assert_eq!(plan.targets.len(), 2, "nothing pinned when planned");
+
+        let swaps = format!(
+            "Filename\tType\tSize\tUsed\tPriority\n{} file 16 0 -1\n",
+            swap.display()
+        );
+        let now = MountTable {
+            pinned: pinned_files(&[], &swaps, &[], |_| false),
+            ..MountTable::default()
+        };
+        let (sender, events) = mpsc::channel();
+        run_against(
+            &plan,
+            RemovalMode::Permanent,
+            TrashBackend::Unavailable,
+            &AtomicBool::new(false),
+            &sender,
+            &now,
+        );
+        drop(sender);
+        let outcomes: Vec<(PathBuf, Result<(), String>)> = events
+            .iter()
+            .filter_map(|event| match event {
+                RemovalEvent::Item { path, outcome, .. } => {
+                    Some((path, outcome))
+                }
+                _ => None,
+            })
+            .collect();
+        let refused = outcomes
+            .iter()
+            .find(|(path, _)| *path == holder)
+            .and_then(|(_, outcome)| outcome.clone().err())
+            .expect("refused");
+        assert!(refused.contains("active swap"), "{refused}");
+        assert!(swap.exists(), "the swap file stays");
+        assert!(!free.exists(), "the rest went");
     }
 
     #[test]

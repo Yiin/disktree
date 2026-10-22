@@ -1030,15 +1030,11 @@ mod tests {
     /// started.
     #[test]
     fn an_agent_that_vanished_is_installed_again_once() {
-        let built = std::env::current_exe()
-            .ok()
-            .and_then(|exe| {
-                Some(exe.parent()?.parent()?.join("disktree-agent"))
-            })
-            .filter(|agent| agent.is_file())
-            .expect("build the agent first: cargo build -p disktree-agent");
-        let real: &'static [u8] =
-            Box::leak(std::fs::read(built).expect("agent").into_boxed_slice());
+        let real: &'static [u8] = Box::leak(
+            std::fs::read(built_agent())
+                .expect("agent")
+                .into_boxed_slice(),
+        );
         let agents =
             |arch: &str| (arch == std::env::consts::ARCH).then_some(real);
         let home = tempfile::tempdir().expect("home");
@@ -1270,17 +1266,11 @@ mod tests {
     fn a_plan_that_failed_is_asked_again() {
         let temp = tempfile::tempdir().expect("temp");
         // The real agent: it refuses a relative root without judging.
-        let agent = std::env::current_exe()
-            .ok()
-            .and_then(|exe| {
-                Some(exe.parent()?.parent()?.join("disktree-agent"))
-            })
-            .filter(|agent| agent.is_file());
-        let Some(agent) = agent else {
-            panic!("build the agent first: cargo build -p disktree-agent");
-        };
-        let remote =
-            Remote::new("testhost".into(), Reach::Direct(agent), Ask::Default);
+        let remote = Remote::new(
+            "testhost".into(),
+            Reach::Direct(built_agent()),
+            Ask::Default,
+        );
         remote.connect().expect("connected");
         let targets = [junk("/srv/junk")];
         let root = Path::new("relative");
@@ -1302,6 +1292,66 @@ mod tests {
             "asked again, not kept"
         );
         let _ = temp;
+    }
+
+    /// The real agent, as `cargo test --workspace` builds it beside this
+    /// test.
+    fn built_agent() -> PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| {
+                Some(exe.parent()?.parent()?.join("disktree-agent"))
+            })
+            .filter(|agent| agent.is_file())
+            .expect("build the agent first: cargo build -p disktree-agent")
+    }
+
+    /// Through the wire, the agent's own guards judge: `/etc` is kept
+    /// back as the system's, and a root that is a link to `/` is refused
+    /// before anything under it is judged.
+    #[test]
+    fn the_agent_judges_a_plan_by_its_own_guards() {
+        let remote = Remote::new(
+            "testhost".into(),
+            Reach::Direct(built_agent()),
+            Ask::Default,
+        );
+        remote.connect().expect("connected");
+        let settled = |path: &Path, root: &Path| {
+            let targets = [Target {
+                path: path.to_path_buf(),
+                bytes: 1,
+                is_dir: true,
+                hidden: false,
+            }];
+            let started = Instant::now();
+            loop {
+                let plan = remote.plan(&targets, root);
+                if !is_checking(&plan) {
+                    return plan;
+                }
+                assert!(started.elapsed() < Duration::from_secs(10), "no plan");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        let etc = settled(Path::new("/etc"), Path::new("/"));
+        assert!(etc.targets.is_empty(), "{etc:?}");
+        assert!(
+            etc.blocked[0]
+                .reason
+                .contains("part of the system under /etc"),
+            "{etc:?}"
+        );
+        let temp = tempfile::tempdir().expect("temp");
+        let link = temp.path().join("r");
+        std::os::unix::fs::symlink("/", &link).expect("link");
+        let through = settled(&link.join("etc"), &link);
+        assert!(through.targets.is_empty(), "{through:?}");
+        assert!(
+            through.blocked[0].reason.contains("is really /"),
+            "{through:?}"
+        );
     }
 
     #[test]
