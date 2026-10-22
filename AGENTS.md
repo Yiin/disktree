@@ -45,13 +45,14 @@ malloc made a static agent scan 4.5 times slower. xtask finds a rustup in
 `~/.local/share/{rustup,cargo}` and zig on `PATH` or in
 `~/.local/share/zig`; `RUSTUP_HOME`, `CARGO_HOME` and `ZIG` override
 them. The app's build script embeds whatever is in `target/agent`, so
-`make build`, `make run` and `make install` build the agents first. Each
-agent carries a hash of the agent and core sources
-(`crates/disktree-agent/source_id.rs`), says it in its hello, and the
-client refuses one that differs from its own; xtask writes the same hash
-to `target/agent/build-id` so the app's build warns early. Lint and test build the agent for
-the host only and need neither; without `target/agent` the app builds and
-`disktree HOST` says to run `make agent`.
+`make build`, `make run` and `make install` build the agents first, so
+they need what `make agent` needs: zig and both musl targets. `cargo build
+--release` builds without agents; that `disktree HOST` says to run `make
+agent`. Lint and test build the agent for the host only and need neither.
+Each agent carries a hash of the workspace manifest and lock and the agent
+and core sources (`crates/disktree-agent/source_id.rs`), says it in its
+hello, and the client refuses one that differs from its own; xtask writes
+the same hash to `target/agent/build-id` so the app's build warns early.
 
 `cargo xtask lint` is the gate. It must be green before anything is called
 done, and it must not fix anything: a red local run is the same signal CI gives.

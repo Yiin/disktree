@@ -10,7 +10,7 @@
 //! notarization, or Gatekeeper stops it.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 const APP: &str = "disktree.app";
@@ -75,7 +75,7 @@ pub fn bundle(args: &[String]) -> Result<(), String> {
         return Err("the app bundle is built on macOS".into());
     }
     let options = parse(args)?;
-    let root = workspace_root();
+    let root = crate::workspace_root();
     let version = env!("CARGO_PKG_VERSION");
     let out = root.join("target/bundle");
     let app = out.join(APP);
@@ -260,12 +260,6 @@ fn notarize(zip: &Path) -> Result<(), String> {
             .arg(var("NOTARY_ISSUER")?);
     }
     tool(&mut command)
-}
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 fn copy(from: &Path, to: &Path) -> Result<(), String> {

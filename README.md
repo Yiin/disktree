@@ -391,8 +391,9 @@ agent`), which needs rustup with
 both musl targets (`rustup target add aarch64-unknown-linux-musl
 x86_64-unknown-linux-musl`) and zig. A rustup and zig under
 `~/.local/share` are found without changing `PATH`; `RUSTUP_HOME`,
-`CARGO_HOME` and `ZIG` name others. A disktree built without them works
-here and says what to run when asked to scan another machine. An agent
+`CARGO_HOME` and `ZIG` name others. Without them, `make build` stops;
+`cargo build --release` builds a disktree that works here and says what
+to run when asked to scan another machine. An agent
 says which sources it was built from when it connects, and disktree
 refuses one built from other sources than its own: it would judge
 removals by older rules. `make agent` and a rebuild fix that, and the

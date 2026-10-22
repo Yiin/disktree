@@ -9,6 +9,7 @@
 mod agent;
 mod bundle;
 
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 const USAGE: &str = "\
@@ -59,6 +60,13 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The workspace this xtask belongs to, wherever it is run from.
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 fn fmt(fix: bool) -> Result<(), String> {

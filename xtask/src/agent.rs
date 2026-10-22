@@ -43,6 +43,12 @@ const TARGETS: [(&str, &str, u16, &str); 2] = [
 const OUT: &str = "target/agent";
 
 pub fn agent(cargo: &str) -> Result<(), String> {
+    // Every path here, and every cargo run, is the workspace's: run from
+    // a crate's folder, cargo would still build into the workspace's
+    // target while the copies looked for it under the crate's.
+    let root = crate::workspace_root();
+    std::env::set_current_dir(&root)
+        .map_err(|err| format!("could not enter {}: {err}", root.display()))?;
     let toolchain = Toolchain::find(cargo);
     for (triple, ..) in TARGETS {
         has_std(&toolchain, triple)?;
@@ -70,7 +76,7 @@ pub fn agent(cargo: &str) -> Result<(), String> {
             .len();
         println!("{}  {size} bytes  sha256 {}", out.display(), sha256(&out)?);
     }
-    write_build_id()
+    write_build_id(&root)
 }
 
 include!("../../crates/disktree-agent/source_id.rs");
@@ -82,8 +88,8 @@ const BUILD_ID: &str = "target/agent/build-id";
 /// Write [`BUILD_ID`]. The agents carry the same id themselves and say it
 /// in their hello, where the client refuses one that differs; this lets
 /// the build warn before that.
-fn write_build_id() -> Result<(), String> {
-    let id = agent_source_id(Path::new("."));
+fn write_build_id(root: &Path) -> Result<(), String> {
+    let id = agent_source_id(root);
     fs::write(BUILD_ID, format!("{id}\n"))
         .map_err(|err| format!("could not write {BUILD_ID}: {err}"))?;
     println!("{BUILD_ID}  {id}");
@@ -351,4 +357,64 @@ fn sha256(path: &Path) -> Result<String, String> {
         }
     }
     Err("neither sha256sum nor shasum is installed".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// xtask names the workspace from its own folder and each build
+    /// script from its crate's: every spelling of it gives one id, and
+    /// none depends on where the command was run.
+    #[test]
+    fn every_spelling_of_the_workspace_gives_one_id() {
+        let root = crate::workspace_root();
+        let id = agent_source_id(&root);
+        let from_app = root.join("crates/disktree-app/../..");
+        assert_eq!(agent_source_id(&from_app), id);
+        let real = root.canonicalize().expect("the workspace");
+        assert_eq!(agent_source_id(&real), id);
+        assert_ne!(agent_source_id(&root.join("crates")), id, "no sources");
+    }
+
+    /// An editor's or a merge's file beside the sources leaves the id as
+    /// it is; the lock, the workspace manifest and a new module change it.
+    #[test]
+    fn only_what_cargo_reads_changes_the_id() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path();
+        let write = |file: &str, text: &str| {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().expect("a folder"))
+                .expect("folders");
+            fs::write(path, text).expect("write");
+        };
+        for file in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "crates/disktree-agent/Cargo.toml",
+            "crates/disktree-agent/src/main.rs",
+            "crates/disktree-core/src/lib.rs",
+        ] {
+            write(file, file);
+        }
+        let id = agent_source_id(root);
+        write("crates/disktree-agent/src/.main.rs.swp", "swap");
+        write("crates/disktree-agent/src/main.rs.orig", "merge");
+        write("crates/disktree-core/src/notes.txt", "notes");
+        write("README.md", "docs");
+        assert_eq!(agent_source_id(root), id, "untracked files");
+
+        let mut seen = vec![id];
+        for (file, text) in [
+            ("Cargo.lock", "a newer dependency"),
+            ("Cargo.toml", "another release profile"),
+            ("crates/disktree-core/src/new/mod.rs", "a module"),
+        ] {
+            write(file, text);
+            let id = agent_source_id(root);
+            assert!(!seen.contains(&id), "{file} left the id as it was");
+            seen.push(id);
+        }
+    }
 }
