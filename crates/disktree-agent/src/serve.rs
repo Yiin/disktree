@@ -3,11 +3,17 @@
 //! Every request but a cancel gets a thread of its own, so a slow
 //! free-space reading on a hung mount never holds up a scan's progress.
 //! Replies from all of them share the output, a whole frame at a time.
+//!
+//! The client's input is read on a thread of its own too, so a frame from
+//! it, a ping at least, is heard however long a reply takes to write.
+//! [`SILENCE`] without one means the link stopped passing packets without
+//! closing, and the agent ends as if the input had.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
@@ -30,6 +36,12 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 /// How often a removal's worker is asked for news. Short: each answer is
 /// one deleted path the review screen is waiting to tick off.
 const REMOVAL_EVERY: Duration = Duration::from_millis(10);
+
+/// How long the agent waits for any frame from the client before it takes
+/// the client for gone. The client pings every 5 s; four of those missed
+/// is a dead link, not a busy one, since pings are sent and read on
+/// threads that no scan or transfer holds up.
+pub const SILENCE: Duration = Duration::from_secs(20);
 
 /// What this machine says about itself.
 pub fn hello() -> Hello {
@@ -60,21 +72,32 @@ fn hostname() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_default()
 }
 
-/// Answer requests from `input` on `output` until `input` ends.
+/// Answer requests from `input` on `output` until `input` ends, or says
+/// nothing for [`SILENCE`].
 ///
 /// Work still running then is cancelled, and abandoned with the process,
 /// which is what a closed connection means: nobody is left to read the
-/// answer, or to cancel it.
+/// answer, or to cancel it. A silent one fails with
+/// [`io::ErrorKind::TimedOut`].
 pub fn serve(
-    input: impl Read,
+    input: impl Read + Send + 'static,
     output: impl Write + Send + 'static,
+) -> io::Result<()> {
+    serve_until_silent(input, output, SILENCE)
+}
+
+/// [`serve`], with the client taken for gone after `silence`.
+fn serve_until_silent(
+    input: impl Read + Send + 'static,
+    output: impl Write + Send + 'static,
+    silence: Duration,
 ) -> io::Result<()> {
     let agent = Arc::new(Agent {
         output: Mutex::new(Box::new(output)),
         cancels: Mutex::new(HashMap::new()),
         gone: AtomicBool::new(false),
     });
-    let served = answer_requests(&agent, input);
+    let served = answer_requests(&agent, input, silence);
     agent.gone.store(true, Ordering::Relaxed);
     for cancel in lock(&agent.cancels).values() {
         cancel.store(true, Ordering::Relaxed);
@@ -82,8 +105,13 @@ pub fn serve(
     served
 }
 
-/// The hello, then every request from `input` until it ends.
-fn answer_requests(agent: &Arc<Agent>, mut input: impl Read) -> io::Result<()> {
+/// The hello, then every request from `input` until it ends or falls
+/// silent.
+fn answer_requests(
+    agent: &Arc<Agent>,
+    input: impl Read + Send + 'static,
+    silence: Duration,
+) -> io::Result<()> {
     removal::prime_mount_points();
     {
         let mut output = lock(&agent.output);
@@ -95,7 +123,24 @@ fn answer_requests(agent: &Arc<Agent>, mut input: impl Read) -> io::Result<()> {
         )?;
         output.flush()?;
     }
-    while let Some((tag, payload)) = read_frame(&mut input)? {
+    let frames = read_frames(input)?;
+    loop {
+        let (tag, payload) = match frames.recv_timeout(silence) {
+            Ok(Ok(Some(frame))) => frame,
+            Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => {
+                return Ok(());
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "no word from the client for {} s: the link is lost",
+                        silence.as_secs_f32()
+                    ),
+                ));
+            }
+        };
         let (id, request) = Request::decode(tag, &payload)?;
         let Some(request) = request else {
             agent.send(
@@ -110,6 +155,9 @@ fn answer_requests(agent: &Arc<Agent>, mut input: impl Read) -> io::Result<()> {
             )?;
             continue;
         };
+        if matches!(request, Request::Ping) {
+            continue;
+        }
         if matches!(request, Request::Cancel) {
             let cancel = lock(&agent.cancels).remove(&id);
             if let Some(cancel) = cancel {
@@ -131,7 +179,30 @@ fn answer_requests(agent: &Arc<Agent>, mut input: impl Read) -> io::Result<()> {
                 lock(&agent.cancels).remove(&id);
             })?;
     }
-    Ok(())
+}
+
+/// A frame from the client, or how its input ended.
+type Frame = io::Result<Option<(u8, Vec<u8>)>>;
+
+/// Every frame from `input` as it arrives, then how it ended. Read apart
+/// from the requests' work, so silence is the link's and not the agent's.
+fn read_frames(
+    input: impl Read + Send + 'static,
+) -> io::Result<mpsc::Receiver<Frame>> {
+    let (frames, arrived) = mpsc::channel();
+    thread::Builder::new()
+        .name("disktree-agent-input".into())
+        .spawn(move || {
+            let mut input = input;
+            loop {
+                let frame = read_frame(&mut input);
+                let last = !matches!(frame, Ok(Some(_)));
+                if frames.send(frame).is_err() || last {
+                    return;
+                }
+            }
+        })?;
+    Ok(arrived)
 }
 
 struct Agent {
@@ -197,7 +268,7 @@ impl Agent {
             Request::PathInfo { path } => {
                 self.send(id, &Reply::PathInfo(path_info(&path)))
             }
-            Request::Cancel => Ok(()),
+            Request::Cancel | Request::Ping => Ok(()),
         }
     }
 
@@ -477,15 +548,12 @@ mod tests {
     }
 
     fn remove_frame(root: &Path, targets: &[Target]) -> Vec<u8> {
-        let (tag, payload) = Request::Remove {
+        let remove = Request::Remove {
             root: root.to_path_buf(),
             targets: targets.to_vec(),
             mode: RemovalMode::Permanent,
-        }
-        .encode(1);
-        let mut frame = Vec::new();
-        write_frame(&mut frame, tag, &payload).unwrap();
-        frame
+        };
+        frame(&remove, 1)
     }
 
     /// A client that can no longer be written to gets nothing removed:
@@ -541,6 +609,107 @@ mod tests {
         assert_eq!(remaining(&targets), left, "it stopped");
     }
 
+    fn frame(request: &Request, id: u64) -> Vec<u8> {
+        let (tag, payload) = request.encode(id);
+        let mut frame = Vec::new();
+        write_frame(&mut frame, tag, &payload).unwrap();
+        frame
+    }
+
+    /// A link that stops passing packets without closing: the input stays
+    /// open and says nothing. The agent takes the client for gone at the
+    /// deadline and stops the removal before its next target.
+    #[test]
+    fn a_removal_stops_when_its_client_falls_silent() {
+        let temp = tempfile::tempdir().unwrap();
+        let targets = directories(temp.path(), 200, 200);
+        let (reader, mut writer) = io::pipe().unwrap();
+        let silence = Duration::from_millis(200);
+        let serving = thread::spawn(move || {
+            serve_until_silent(reader, Captured::default(), silence)
+        });
+        writer
+            .write_all(&remove_frame(temp.path(), &targets))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let error = serving.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5), "it waited");
+        // Long enough for every target to go, had it gone on.
+        thread::sleep(Duration::from_millis(1500));
+        let left = remaining(&targets);
+        assert!(left > 0, "every target went");
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(remaining(&targets), left, "it stopped");
+        // Still open: the silence alone ended it.
+        drop(writer);
+    }
+
+    /// Output that holds every write while `stalled` is set: a reply that
+    /// takes long to cross a slow link.
+    #[derive(Clone, Default)]
+    struct Stallable {
+        written: Captured,
+        stalled: Arc<AtomicBool>,
+    }
+
+    impl Write for Stallable {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            while self.stalled.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            self.written.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A scan whose replies are held up for many deadlines still ends
+    /// with its tree, as long as the client keeps pinging: pings are read
+    /// apart from the work.
+    #[test]
+    fn a_long_scan_with_pings_completes() {
+        let temp = tempfile::tempdir().unwrap();
+        directories(temp.path(), 10, 10);
+        let (reader, mut writer) = io::pipe().unwrap();
+        let output = Stallable::default();
+        let silence = Duration::from_millis(200);
+        let serving = thread::spawn({
+            let output = output.clone();
+            move || serve_until_silent(reader, output, silence)
+        });
+        while lock(&output.written.0).is_empty() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        output.stalled.store(true, Ordering::Relaxed);
+        let scan = Request::Scan {
+            root: temp.path().to_path_buf(),
+            options: ScanOptions::default(),
+        };
+        writer.write_all(&frame(&scan, 1)).unwrap();
+        let started = std::time::Instant::now();
+        while started.elapsed() < silence * 5 {
+            writer.write_all(&frame(&Request::Ping, 0)).unwrap();
+            thread::sleep(silence / 4);
+        }
+        output.stalled.store(false, Ordering::Relaxed);
+        let ended = |written: &[u8]| {
+            let mut stream = written;
+            read_preamble(&mut stream).unwrap();
+            std::iter::from_fn(|| read_frame(&mut stream).ok().flatten())
+                .any(|(tag, _)| tag == tag::TREE_END)
+        };
+        while !ended(&lock(&output.written.0)) {
+            assert!(!serving.is_finished(), "the agent stopped serving");
+            writer.write_all(&frame(&Request::Ping, 0)).unwrap();
+            thread::sleep(silence / 4);
+        }
+        drop(writer);
+        serving.join().unwrap().unwrap();
+    }
+
     #[test]
     fn an_unknown_request_is_answered_and_the_agent_keeps_serving() {
         let mut input = Vec::new();
@@ -548,7 +717,7 @@ mod tests {
         // cannot read.
         write_frame(&mut input, 99, &[5, 0xFF, 0xFF]).unwrap();
         let output = Captured::default();
-        serve(input.as_slice(), output.clone()).unwrap();
+        serve(io::Cursor::new(input), output.clone()).unwrap();
 
         let written = lock(&output.0).clone();
         let mut stream = written.as_slice();

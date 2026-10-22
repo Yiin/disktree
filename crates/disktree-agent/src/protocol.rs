@@ -28,7 +28,8 @@ use crate::wire::{Decoder, Encoder, invalid};
 ///
 /// 2: git state, and what is at a path.
 /// 3: the agent's build in its hello, and a removal whose link was lost.
-pub const PROTOCOL: u32 = 3;
+/// 4: the client's heartbeat.
+pub const PROTOCOL: u32 = 4;
 
 /// The id of the sources this crate was built from; see `source_id.rs`.
 ///
@@ -62,6 +63,7 @@ pub mod tag {
     pub const LIST_VOLUMES: u8 = 37;
     pub const GIT_STATE_OF: u8 = 38;
     pub const PATH_INFO_OF: u8 = 39;
+    pub const PING: u8 = 40;
 }
 
 /// What an agent says about itself and its machine before anything else.
@@ -136,6 +138,10 @@ pub enum Request {
     PathInfo {
         path: PathBuf,
     },
+    /// The client is still there. Never answered: the agent only needs
+    /// to hear something now and then to tell a live link from one that
+    /// stopped passing packets without closing.
+    Ping,
 }
 
 #[derive(Clone, Debug)]
@@ -294,6 +300,7 @@ impl Request {
                 out.path(path);
                 tag::PATH_INFO_OF
             }
+            Self::Ping => tag::PING,
         };
         (tag, out.buf)
     }
@@ -334,6 +341,7 @@ impl Request {
             tag::PATH_INFO_OF => Self::PathInfo {
                 path: input.path()?,
             },
+            tag::PING => Self::Ping,
             _ => return Ok((id, None)),
         };
         Ok((id, Some(request)))

@@ -16,7 +16,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,11 @@ const HANDSHAKE: Duration = Duration::from_secs(30);
 /// stuck, and the caller gets an error instead of a thread parked for
 /// good.
 const ANSWER_DEADLINE: Duration = Duration::from_secs(15);
+
+/// How often the client pings the agent. The agent takes 20 s without a
+/// frame for a lost link (`serve::SILENCE`), so this leaves three pings
+/// to go missing before it gives up.
+const HEARTBEAT: Duration = Duration::from_secs(5);
 
 /// What to do about an agent from other sources than this client.
 const STALE: &str =
@@ -85,7 +90,12 @@ impl Client {
     /// Fails when it is not an agent, speaks another protocol, exits, or
     /// says nothing for [`HANDSHAKE`]; the error carries what it wrote
     /// to stderr, which is where ssh explains itself.
-    pub fn connect(mut command: Command) -> io::Result<Self> {
+    pub fn connect(command: Command) -> io::Result<Self> {
+        Self::start(command, HEARTBEAT)
+    }
+
+    /// [`Self::connect`], pinging every `heartbeat` once introduced.
+    fn start(mut command: Command, heartbeat: Duration) -> io::Result<Self> {
         let program = command.get_program().to_string_lossy().into_owned();
         let mut child = command
             .stdin(Stdio::piped())
@@ -136,11 +146,14 @@ impl Client {
             )),
         };
         match outcome {
-            Ok(hello) => Ok(Self {
-                hello,
-                shared,
-                child,
-            }),
+            Ok(hello) => {
+                ping(Arc::downgrade(&shared), heartbeat)?;
+                Ok(Self {
+                    hello,
+                    shared,
+                    child,
+                })
+            }
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -370,6 +383,28 @@ impl Shared {
         }
         routes.closed = Some(reason);
     }
+}
+
+/// Ping the agent every `heartbeat` from a thread of its own, so a long
+/// transfer or a busy caller never keeps it quiet. Ends when the client
+/// is dropped or a ping cannot be written: a link that fails a write is
+/// closed already, and the reader says so.
+fn ping(shared: Weak<Shared>, heartbeat: Duration) -> io::Result<()> {
+    thread::Builder::new()
+        .name("disktree-agent-ping".into())
+        .spawn(move || {
+            loop {
+                thread::sleep(heartbeat);
+                let Some(shared) = shared.upgrade() else {
+                    return;
+                };
+                // Ids start at 1: a ping answers to nobody.
+                if shared.write(0, &Request::Ping).is_err() {
+                    return;
+                }
+            }
+        })?;
+    Ok(())
 }
 
 /// The reader thread: the handshake, then every reply to its request.
@@ -792,5 +827,45 @@ mod tests {
             lock(&client.shared.routes).open.is_empty(),
             "a route stayed"
         );
+    }
+
+    /// Once introduced, the client pings on its own, with nothing asked:
+    /// the agent hears from a live link however quiet the app is.
+    #[test]
+    fn a_connected_client_pings_the_agent() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut introduction = crate::protocol::preamble();
+        crate::wire::write_frame(
+            &mut introduction,
+            tag::HELLO,
+            &crate::serve::hello().encode(),
+        )
+        .unwrap();
+        let script = temp.path().join("introduction");
+        std::fs::write(&script, introduction).unwrap();
+        let heard = temp.path().join("heard");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!("cat '{}'; cat > '{}'", script.display(), heard.display()),
+        ]);
+        let client = Client::start(command, Duration::from_millis(20)).unwrap();
+
+        let pings = || {
+            let bytes = std::fs::read(&heard).unwrap_or_default();
+            let mut stream = bytes.as_slice();
+            std::iter::from_fn(|| read_frame(&mut stream).ok().flatten())
+                .map(|(tag, payload)| Request::decode(tag, &payload).unwrap())
+                .inspect(|(_, request)| {
+                    assert!(matches!(request, Some(Request::Ping)));
+                })
+                .count()
+        };
+        let started = Instant::now();
+        while pings() < 3 {
+            assert!(started.elapsed() < Duration::from_secs(5), "no pings");
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(client);
     }
 }

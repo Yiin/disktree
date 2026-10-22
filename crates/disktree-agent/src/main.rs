@@ -43,7 +43,7 @@ fn main() -> ExitCode {
 
 fn serve() -> io::Result<()> {
     disktree_agent::serve(
-        io::stdin().lock(),
+        io::stdin(),
         BufWriter::with_capacity(1 << 16, raw_stdout()?),
     )
 }

@@ -406,7 +406,12 @@ restarting as administrator are about this machine and say so. A remote
 scan is not memoized when it widens.
 
 If the connection drops, the window stays open with the reason, and `r`
-connects again and scans.
+connects again and scans. A link that stops passing packets without
+closing, after a Wi-Fi drop or a sleep, counts as dropped within about
+20 s on both sides: ssh gives up after three missed keepalives, and the
+agent, which hears from disktree every 5 s, stops a running removal and
+exits. A removal cut off that way says its outcome is unknown; rescan to
+see what went.
 
 ## What it refuses to do
 
